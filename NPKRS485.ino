@@ -28,6 +28,12 @@ ModbusMaster node;
 #define RXD2 16
 #define TXD2 17
 
+// ================= RELAY =================
+#define RELAY1 25
+#define RELAY2 26
+#define RELAY3 27
+#define RELAY4 14
+
 // ================= TIMING =================
 unsigned long lastReadTime = 0;
 const unsigned long READ_INTERVAL = 2000;
@@ -86,6 +92,18 @@ uint16_t readRegister(uint16_t reg) {
 
 void setup() {
   Serial.begin(115200);
+
+  // ================= RELAY SETUP =================
+  pinMode(RELAY1, OUTPUT);
+  pinMode(RELAY2, OUTPUT);
+  pinMode(RELAY3, OUTPUT);
+  pinMode(RELAY4, OUTPUT);
+
+  // Relay OFF awal
+  digitalWrite(RELAY1, LOW);
+  digitalWrite(RELAY2, LOW);
+  digitalWrite(RELAY3, LOW);
+  digitalWrite(RELAY4, LOW);
 
   // Setup pin MAX485
   pinMode(MAX485_DE_RE, OUTPUT);
@@ -198,6 +216,10 @@ void loop() {
     payload += "\"nitrogen\":" + String(nitrogen) + ",";
     payload += "\"phosphorus\":" + String(phosphorus) + ",";
     payload += "\"potassium\":" + String(potassium);
+    payload += ",\"relay1\":" + String(digitalRead(RELAY1) == LOW ? 1 : 0);
+    payload += ",\"relay2\":" + String(digitalRead(RELAY2) == LOW ? 1 : 0);
+    payload += ",\"relay3\":" + String(digitalRead(RELAY3) == LOW ? 1 : 0);
+    payload += ",\"relay4\":" + String(digitalRead(RELAY4) == LOW ? 1 : 0);
 
     payload += "}";
 
