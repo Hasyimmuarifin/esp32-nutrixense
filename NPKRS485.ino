@@ -2,10 +2,11 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ModbusMaster.h>
+#include <ArduinoJson.h>
 
 // ================= WIFI =================
-const char* ssid = "Hasyim_M";
-const char* password = "Koseka123";
+const char* ssid = "halal";
+const char* password = "MAU MASUK SURGA ibadah";
 
 // ================= HIVEMQ =================
 const char* mqtt_server = "a8805b4f45744c3f9ac83882e423e0c0.s1.eu.hivemq.cloud";
@@ -67,6 +68,8 @@ void reconnect() {
 
     if (client.connect("ESP32_Client", mqtt_user, mqtt_pass)) {
       Serial.println("Connected!");
+      client.subscribe("nutrixense/control");
+      Serial.println("Subscribed: nutrixense/control");
     } else {
       Serial.print("Failed, rc=");
       Serial.print(client.state());
@@ -87,6 +90,69 @@ uint16_t readRegister(uint16_t reg) {
     Serial.print("Failed reading register: 0x");
     Serial.println(reg, HEX);
     return 0;
+  }
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.println("]");
+
+  String message;
+
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+
+  Serial.println(message);
+
+  // Parse JSON
+  StaticJsonDocument<200> doc;
+
+  DeserializationError error = deserializeJson(doc, message);
+
+  if (error) {
+    Serial.println("JSON Parse Failed");
+    return;
+  }
+
+  // ================= RELAY CONTROL =================
+
+  if (doc.containsKey("relay1")) {
+    int state = doc["relay1"];
+
+    digitalWrite(RELAY1, state ? LOW : HIGH);
+
+    Serial.print("Relay1: ");
+    Serial.println(state ? "ON" : "OFF");
+  }
+
+  if (doc.containsKey("relay2")) {
+    int state = doc["relay2"];
+
+    digitalWrite(RELAY2, state ? LOW : HIGH);
+
+    Serial.print("Relay2: ");
+    Serial.println(state ? "ON" : "OFF");
+  }
+
+  if (doc.containsKey("relay3")) {
+    int state = doc["relay3"];
+
+    digitalWrite(RELAY3, state ? LOW : HIGH);
+
+    Serial.print("Relay3: ");
+    Serial.println(state ? "ON" : "OFF");
+  }
+
+  if (doc.containsKey("relay4")) {
+    int state = doc["relay4"];
+
+    digitalWrite(RELAY4, state ? LOW : HIGH);
+
+    Serial.print("Relay4: ");
+    Serial.println(state ? "ON" : "OFF");
   }
 }
 
@@ -125,6 +191,7 @@ void setup() {
   espClient.setInsecure(); 
 
   client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
 
   Serial.println("System Ready...");
 }
