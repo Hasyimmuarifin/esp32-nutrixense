@@ -12,7 +12,7 @@ const char* password = "MAU MASUK SURGA ibadah";
 const char* mqtt_server = "a8805b4f45744c3f9ac83882e423e0c0.s1.eu.hivemq.cloud";
 const int mqtt_port = 8883;
 const char* mqtt_user = "hasyim";
-const char* mqtt_pass = "hasyimHiveMQTT#22";
+const char* mqtt_pass = "hasyimHiveMQTT@22";
 const char* topic = "nutrixense/sensor";
 
 // ================= MQTT =================
@@ -30,22 +30,163 @@ ModbusMaster node;
 #define TXD2 17
 
 // ================= RELAY =================
+// Relay module uses active LOW: LOW = ON, HIGH = OFF
 #define RELAY1 25
 #define RELAY2 26
 #define RELAY3 27
 #define RELAY4 14
 
+#define RELAY_ON LOW
+#define RELAY_OFF HIGH
+
+// ================= BUZZER =================
+#define BUZZER_PIN 12
+
+// If your buzzer still sounds when it should be OFF,
+// swap these two values.
+#define BUZZER_ON HIGH
+#define BUZZER_OFF LOW
+
 // ================= TIMING =================
 unsigned long lastReadTime = 0;
 const unsigned long READ_INTERVAL = 2000;
 const unsigned long SENSOR_DELAY = 100;
+bool sensorReadSuccess = true;
+
+// ================= NUTRITION THRESHOLD =================
+float MIN_NITROGEN = 40;
+float MIN_PHOSPHORUS = 20;
+float MIN_POTASSIUM = 40;
+
+float MIN_PH = 5.8;
+float MIN_MOISTURE = 40.0;
+float MIN_TEMPERATURE = 18.0;
+float MIN_EC = 1.0;
+
+float MAX_NITROGEN = 80;
+float MAX_PHOSPHORUS = 60;
+float MAX_POTASSIUM = 100;
+
+float MAX_PH = 7.2;
+float MAX_MOISTURE = 80.0;
+float MAX_TEMPERATURE = 35.0;
+float MAX_EC = 3.0;
 
 void preTransmission() {
-  digitalWrite(MAX485_DE_RE, HIGH); // Send Mode
+  digitalWrite(MAX485_DE_RE, HIGH);
 }
 
 void postTransmission() {
-  digitalWrite(MAX485_DE_RE, LOW); // Receive Mode
+  digitalWrite(MAX485_DE_RE, LOW);
+}
+
+void printThresholds() {
+
+  Serial.println("===== CURRENT THRESHOLDS =====");
+
+  Serial.print("Nitrogen     : ");
+  Serial.print(MIN_NITROGEN);
+  Serial.print(" - ");
+  Serial.println(MAX_NITROGEN);
+
+  Serial.print("Phosphorus   : ");
+  Serial.print(MIN_PHOSPHORUS);
+  Serial.print(" - ");
+  Serial.println(MAX_PHOSPHORUS);
+
+  Serial.print("Potassium    : ");
+  Serial.print(MIN_POTASSIUM);
+  Serial.print(" - ");
+  Serial.println(MAX_POTASSIUM);
+
+  Serial.print("pH           : ");
+  Serial.print(MIN_PH);
+  Serial.print(" - ");
+  Serial.println(MAX_PH);
+
+  Serial.print("Moisture     : ");
+  Serial.print(MIN_MOISTURE);
+  Serial.print(" - ");
+  Serial.println(MAX_MOISTURE);
+
+  Serial.print("Temperature  : ");
+  Serial.print(MIN_TEMPERATURE);
+  Serial.print(" - ");
+  Serial.println(MAX_TEMPERATURE);
+
+  Serial.print("EC           : ");
+  Serial.print(MIN_EC);
+  Serial.print(" - ");
+  Serial.println(MAX_EC);
+}
+
+void printThresholdCheck(
+  float nitrogen,
+  float phosphorus,
+  float potassium,
+  float ph,
+  float moisture,
+  float temperature,
+  float ec
+) {
+
+  Serial.println("===== DEBUG THRESHOLD CHECK =====");
+
+  Serial.print("Nitrogen     : ");
+  Serial.print(nitrogen);
+  Serial.print(" (");
+  Serial.print(MIN_NITROGEN);
+  Serial.print(" - ");
+  Serial.print(MAX_NITROGEN);
+  Serial.println(")");
+
+  Serial.print("Phosphorus   : ");
+  Serial.print(phosphorus);
+  Serial.print(" (");
+  Serial.print(MIN_PHOSPHORUS);
+  Serial.print(" - ");
+  Serial.print(MAX_PHOSPHORUS);
+  Serial.println(")");
+
+  Serial.print("Potassium    : ");
+  Serial.print(potassium);
+  Serial.print(" (");
+  Serial.print(MIN_POTASSIUM);
+  Serial.print(" - ");
+  Serial.print(MAX_POTASSIUM);
+  Serial.println(")");
+
+  Serial.print("pH           : ");
+  Serial.print(ph);
+  Serial.print(" (");
+  Serial.print(MIN_PH);
+  Serial.print(" - ");
+  Serial.print(MAX_PH);
+  Serial.println(")");
+
+  Serial.print("Moisture     : ");
+  Serial.print(moisture);
+  Serial.print(" (");
+  Serial.print(MIN_MOISTURE);
+  Serial.print(" - ");
+  Serial.print(MAX_MOISTURE);
+  Serial.println(")");
+
+  Serial.print("Temperature  : ");
+  Serial.print(temperature);
+  Serial.print(" (");
+  Serial.print(MIN_TEMPERATURE);
+  Serial.print(" - ");
+  Serial.print(MAX_TEMPERATURE);
+  Serial.println(")");
+
+  Serial.print("EC           : ");
+  Serial.print(ec);
+  Serial.print(" (");
+  Serial.print(MIN_EC);
+  Serial.print(" - ");
+  Serial.print(MAX_EC);
+  Serial.println(")");
 }
 
 // ================= WIFI =================
@@ -68,8 +209,12 @@ void reconnect() {
 
     if (client.connect("ESP32_Client", mqtt_user, mqtt_pass)) {
       Serial.println("Connected!");
+
       client.subscribe("nutrixense/control");
       Serial.println("Subscribed: nutrixense/control");
+
+      client.subscribe("nutrixense/config");
+      Serial.println("Subscribed: nutrixense/config");
     } else {
       Serial.print("Failed, rc=");
       Serial.print(client.state());
@@ -80,23 +225,28 @@ void reconnect() {
 }
 
 // ================= READ REGISTER =================
-uint16_t readRegister(uint16_t reg) {
+uint16_t readRegister(uint16_t reg, bool &success) {
 
   uint8_t result = node.readHoldingRegisters(reg, 1);
 
   if (result == node.ku8MBSuccess) {
+    success = true;
     return node.getResponseBuffer(0);
-  } else {
-    Serial.print("Failed reading register: 0x");
-    Serial.println(reg, HEX);
-    return 0;
   }
+
+  success = false;
+
+  Serial.print("Failed reading register: 0x");
+  Serial.println(reg, HEX);
+
+  return 0;
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
+  String topicStr = String(topic);
 
   Serial.print("Message arrived [");
-  Serial.print(topic);
+  Serial.print(topicStr);
   Serial.println("]");
 
   String message;
@@ -107,52 +257,144 @@ void callback(char* topic, byte* payload, unsigned int length) {
 
   Serial.println(message);
 
-  // Parse JSON
-  StaticJsonDocument<200> doc;
+  DynamicJsonDocument doc(2048);
 
   DeserializationError error = deserializeJson(doc, message);
 
   if (error) {
-    Serial.println("JSON Parse Failed");
+    Serial.print("JSON Parse Failed: ");
+    Serial.println(error.c_str());
     return;
   }
 
-  // ================= RELAY CONTROL =================
+  Serial.println("=== JSON RECEIVED ===");
+  serializeJsonPretty(doc, Serial);
+  Serial.println();
 
-  if (doc.containsKey("relay1")) {
-    int state = doc["relay1"];
+  // =====================================================
+  // MQTT TOPIC : nutrixense/control
+  // =====================================================
+  if (topicStr == "nutrixense/control") {
+    Serial.println("=== RELAY CONTROL ===");
 
-    digitalWrite(RELAY1, state ? LOW : HIGH);
+    if (doc.containsKey("relay1")) {
+      int state = doc["relay1"].as<int>();
+      digitalWrite(RELAY1, state ? RELAY_ON : RELAY_OFF);
 
-    Serial.print("Relay1: ");
-    Serial.println(state ? "ON" : "OFF");
+      Serial.print("Relay1: ");
+      Serial.println(state ? "ON" : "OFF");
+    }
+
+    if (doc.containsKey("relay2")) {
+      int state = doc["relay2"].as<int>();
+      digitalWrite(RELAY2, state ? RELAY_ON : RELAY_OFF);
+
+      Serial.print("Relay2: ");
+      Serial.println(state ? "ON" : "OFF");
+    }
+
+    if (doc.containsKey("relay3")) {
+      int state = doc["relay3"].as<int>();
+      digitalWrite(RELAY3, state ? RELAY_ON : RELAY_OFF);
+
+      Serial.print("Relay3: ");
+      Serial.println(state ? "ON" : "OFF");
+    }
+
+    if (doc.containsKey("relay4")) {
+      int state = doc["relay4"].as<int>();
+      digitalWrite(RELAY4, state ? RELAY_ON : RELAY_OFF);
+
+      Serial.print("Relay4: ");
+      Serial.println(state ? "ON" : "OFF");
+    }
   }
 
-  if (doc.containsKey("relay2")) {
-    int state = doc["relay2"];
+  // =====================================================
+  // MQTT TOPIC : nutrixense/config
+  // =====================================================
+  else if (topicStr == "nutrixense/config") {
+    Serial.println("=== THRESHOLD CONFIG ===");
 
-    digitalWrite(RELAY2, state ? LOW : HIGH);
+    if (doc.containsKey("min_nitrogen")) {
+      MIN_NITROGEN = doc["min_nitrogen"].as<float>();
+    }
 
-    Serial.print("Relay2: ");
-    Serial.println(state ? "ON" : "OFF");
+    if (doc.containsKey("min_phosphorus")) {
+      MIN_PHOSPHORUS = doc["min_phosphorus"].as<float>();
+    }
+
+    if (doc.containsKey("min_potassium")) {
+      MIN_POTASSIUM = doc["min_potassium"].as<float>();
+    }
+
+    if (doc.containsKey("min_ph")) {
+      MIN_PH = doc["min_ph"].as<float>();
+    }
+
+    if (doc.containsKey("min_moisture")) {
+      MIN_MOISTURE = doc["min_moisture"].as<float>();
+    }
+
+    if (doc.containsKey("min_temperature")) {
+      MIN_TEMPERATURE = doc["min_temperature"].as<float>();
+    }
+
+    if (doc.containsKey("min_ec")) {
+      MIN_EC = doc["min_ec"].as<float>();
+    }
+
+    if (doc.containsKey("max_nitrogen")) {
+      MAX_NITROGEN = doc["max_nitrogen"].as<float>();
+    }
+
+    if (doc.containsKey("max_phosphorus")) {
+      MAX_PHOSPHORUS = doc["max_phosphorus"].as<float>();
+    }
+
+    if (doc.containsKey("max_potassium")) {
+      MAX_POTASSIUM = doc["max_potassium"].as<float>();
+    }
+
+    if (doc.containsKey("max_ph")) {
+      MAX_PH = doc["max_ph"].as<float>();
+    }
+
+    if (doc.containsKey("max_moisture")) {
+      MAX_MOISTURE = doc["max_moisture"].as<float>();
+    }
+
+    if (doc.containsKey("max_temperature")) {
+      MAX_TEMPERATURE = doc["max_temperature"].as<float>();
+    }
+
+    if (doc.containsKey("max_ec")) {
+      MAX_EC = doc["max_ec"].as<float>();
+    }
+
+    Serial.println("=== THRESHOLD UPDATED ===");
+    printThresholds();
+
+    if (
+      MIN_NITROGEN <= 0 &&
+      MIN_PHOSPHORUS <= 0 &&
+      MIN_POTASSIUM <= 0 &&
+      MIN_PH <= 0 &&
+      MIN_MOISTURE <= 0 &&
+      MIN_TEMPERATURE <= 0 &&
+      MIN_EC <= 0
+    ) {
+      digitalWrite(BUZZER_PIN, BUZZER_OFF);
+      Serial.println("All minimum thresholds are 0. Buzzer forced OFF.");
+    }
   }
 
-  if (doc.containsKey("relay3")) {
-    int state = doc["relay3"];
-
-    digitalWrite(RELAY3, state ? LOW : HIGH);
-
-    Serial.print("Relay3: ");
-    Serial.println(state ? "ON" : "OFF");
-  }
-
-  if (doc.containsKey("relay4")) {
-    int state = doc["relay4"];
-
-    digitalWrite(RELAY4, state ? LOW : HIGH);
-
-    Serial.print("Relay4: ");
-    Serial.println(state ? "ON" : "OFF");
+  // =====================================================
+  // UNKNOWN TOPIC
+  // =====================================================
+  else {
+    Serial.print("Unknown MQTT Topic: ");
+    Serial.println(topicStr);
   }
 }
 
@@ -165,11 +407,17 @@ void setup() {
   pinMode(RELAY3, OUTPUT);
   pinMode(RELAY4, OUTPUT);
 
-  // Relay OFF awal
-  digitalWrite(RELAY1, LOW);
-  digitalWrite(RELAY2, LOW);
-  digitalWrite(RELAY3, LOW);
-  digitalWrite(RELAY4, LOW);
+  // Relay OFF awal (Logical Exceptions are swapped here)
+  digitalWrite(RELAY1, RELAY_ON);
+  digitalWrite(RELAY2, RELAY_ON);
+  digitalWrite(RELAY3, RELAY_ON);
+  digitalWrite(RELAY4, RELAY_ON);
+
+  // ================= BUZZER SETUP =================
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  // Buzzer awal mati
+  digitalWrite(BUZZER_PIN, BUZZER_OFF);
 
   // Setup pin MAX485
   pinMode(MAX485_DE_RE, OUTPUT);
@@ -178,68 +426,78 @@ void setup() {
   // Serial RS485 Communication
   Serial2.begin(4800, SERIAL_8N1, RXD2, TXD2);
 
-  // Slave ID sensor (default = 1)
+  // Slave ID sensor default = 1
   node.begin(1, Serial2);
-
 
   node.preTransmission(preTransmission);
   node.postTransmission(postTransmission);
 
   setup_wifi();
 
-  // ⚠️ SSL (for HiveMQ Cloud)
-  espClient.setInsecure(); 
+  // SSL for HiveMQ Cloud
+  espClient.setInsecure();
 
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
+  client.setBufferSize(2048);
 
   Serial.println("System Ready...");
 }
 
 void loop() {
-
   if (!client.connected()) {
     reconnect();
   }
 
   client.loop();
 
-  // Interval Read
   if (millis() - lastReadTime >= READ_INTERVAL) {
-
     Serial.println("\n===== READING SENSOR =====");
 
-    // ================= READ SENSOR =================
+    sensorReadSuccess = true;
 
-    // 0x00 = Moisture
-    float moisture = readRegister(0x00) / 10.0;
-    delay(SENSOR_DELAY);
+    uint8_t result = node.readHoldingRegisters(0x00, 7);
 
-    // 0x01 = Temperature
-    float temperature = readRegister(0x01) / 10.0;
-    delay(SENSOR_DELAY);
+    float moisture = 0;
+    float temperature = 0;
+    float ec = 0;
+    float ph = 0;
+    float nitrogen = 0;
+    float phosphorus = 0;
+    float potassium = 0;
 
-    // 0x02 = EC
-    uint16_t ec = readRegister(0x02);
-    delay(SENSOR_DELAY);
+    if (result == node.ku8MBSuccess) {
 
-    // 0x03 = pH
-    float ph = readRegister(0x03) / 10.0;
-    delay(SENSOR_DELAY);
+      moisture =
+        node.getResponseBuffer(0) / 10.0;
 
-    // 0x04 = Nitrogen
-    uint16_t nitrogen = readRegister(0x04);
-    delay(SENSOR_DELAY);
+      int16_t tempRaw =
+        (int16_t)node.getResponseBuffer(1);
 
-    // 0x05 = Phosphorus
-    uint16_t phosphorus = readRegister(0x05);
-    delay(SENSOR_DELAY);
+      temperature =
+        tempRaw / 10.0;
 
-    // 0x06 = Potassium
-    uint16_t potassium = readRegister(0x06);
-    delay(SENSOR_DELAY);
+      ec =
+        node.getResponseBuffer(2) / 100.0;
 
-    // ================= SERIAL OUTPUT =================
+      ph =
+        node.getResponseBuffer(3) / 10.0;
+
+      nitrogen =
+        node.getResponseBuffer(4);
+
+      phosphorus =
+        node.getResponseBuffer(5);
+
+      potassium =
+        node.getResponseBuffer(6);
+
+    } else {
+
+      sensorReadSuccess = false;
+
+      Serial.println("FAILED reading sensor registers!");
+    }
 
     Serial.println("===== HASIL SENSOR =====");
 
@@ -253,7 +511,7 @@ void loop() {
 
     Serial.print("EC            : ");
     Serial.print(ec);
-    Serial.println(" us/cm");
+    Serial.println(" mS/cm");
 
     Serial.print("pH            : ");
     Serial.println(ph);
@@ -272,28 +530,87 @@ void loop() {
 
     Serial.println("==========================");
 
-    // ================= JSON MQTT =================
+    if (!sensorReadSuccess) {
+
+      Serial.println("Sensor read failed!");
+      Serial.println("Skipping threshold check...");
+
+      digitalWrite(BUZZER_PIN, BUZZER_OFF);
+
+      lastReadTime = millis();
+      return;
+    }
+
+    printThresholdCheck(
+      nitrogen,
+      phosphorus,
+      potassium,
+      ph,
+      moisture,
+      temperature,
+      ec
+    );
+
+    bool nutrientAbnormal =
+
+      // BELOW MIN
+      (nitrogen < MIN_NITROGEN) ||
+      (phosphorus < MIN_PHOSPHORUS) ||
+      (potassium < MIN_POTASSIUM) ||
+      (ph < MIN_PH) ||
+      (moisture < MIN_MOISTURE) ||
+      (temperature < MIN_TEMPERATURE) ||
+      (ec < MIN_EC) ||
+
+      // ABOVE MAX
+      (nitrogen > MAX_NITROGEN) ||
+      (phosphorus > MAX_PHOSPHORUS) ||
+      (potassium > MAX_POTASSIUM) ||
+      (ph > MAX_PH) ||
+      (moisture > MAX_MOISTURE) ||
+      (temperature > MAX_TEMPERATURE) ||
+      (ec > MAX_EC);
+
+    Serial.print("nutrientAbnormal = ");
+    Serial.println(nutrientAbnormal ? "TRUE" : "FALSE");
+
+    if (nutrientAbnormal) {
+      digitalWrite(BUZZER_PIN, BUZZER_ON);
+
+      Serial.println("WARNING: Nutrisi di bawah ambang normal!");
+      Serial.println("Buzzer ON");
+    } else {
+      digitalWrite(BUZZER_PIN, BUZZER_OFF);
+
+      Serial.println("Nutrisi Normal");
+      Serial.println("Buzzer OFF");
+    }
 
     String payload = "{";
 
     payload += "\"moisture\":" + String(moisture, 1) + ",";
     payload += "\"temperature\":" + String(temperature, 1) + ",";
-    payload += "\"ec\":" + String(ec) + ",";
+    payload += "\"ec\":" + String(ec, 2) + ",";
     payload += "\"ph\":" + String(ph, 1) + ",";
-    payload += "\"nitrogen\":" + String(nitrogen) + ",";
-    payload += "\"phosphorus\":" + String(phosphorus) + ",";
-    payload += "\"potassium\":" + String(potassium);
-    payload += ",\"relay1\":" + String(digitalRead(RELAY1) == LOW ? 1 : 0);
-    payload += ",\"relay2\":" + String(digitalRead(RELAY2) == LOW ? 1 : 0);
-    payload += ",\"relay3\":" + String(digitalRead(RELAY3) == LOW ? 1 : 0);
-    payload += ",\"relay4\":" + String(digitalRead(RELAY4) == LOW ? 1 : 0);
+    payload += "\"nitrogen\":" + String(nitrogen, 1) + ",";
+    payload += "\"phosphorus\":" + String(phosphorus, 1) + ",";
+    payload += "\"potassium\":" + String(potassium, 1);
+    payload += ",\"relay1\":" + String(digitalRead(RELAY1) == RELAY_ON ? 1 : 0);
+    payload += ",\"relay2\":" + String(digitalRead(RELAY2) == RELAY_ON ? 1 : 0);
+    payload += ",\"relay3\":" + String(digitalRead(RELAY3) == RELAY_ON ? 1 : 0);
+    payload += ",\"relay4\":" + String(digitalRead(RELAY4) == RELAY_ON ? 1 : 0);
+    payload += ",\"buzzer\":" + String(digitalRead(BUZZER_PIN) == BUZZER_ON ? 1 : 0);
 
     payload += "}";
 
     Serial.println("Sending MQTT:");
     Serial.println(payload);
 
-    client.publish(topic, payload.c_str());
+    if (client.publish(topic, payload.c_str())) {
+      Serial.println("MQTT Publish Success");
+    } else {
+      Serial.println("MQTT Publish Failed");
+    }
 
     lastReadTime = millis();
   }
