@@ -36,8 +36,8 @@ ModbusMaster node;
 #define RELAY3 27
 #define RELAY4 14
 
-#define RELAY_ON LOW
-#define RELAY_OFF HIGH
+#define RELAY_OFF LOW
+#define RELAY_ON HIGH
 
 // ================= BUZZER =================
 #define BUZZER_PIN 12
@@ -407,11 +407,11 @@ void setup() {
   pinMode(RELAY3, OUTPUT);
   pinMode(RELAY4, OUTPUT);
 
-  // Relay OFF awal (Logical Exceptions are swapped here)
-  digitalWrite(RELAY1, RELAY_ON);
-  digitalWrite(RELAY2, RELAY_ON);
-  digitalWrite(RELAY3, RELAY_ON);
-  digitalWrite(RELAY4, RELAY_ON);
+  // Relay OFF awal
+  digitalWrite(RELAY1, RELAY_OFF);
+  digitalWrite(RELAY2, RELAY_OFF);
+  digitalWrite(RELAY3, RELAY_OFF);
+  digitalWrite(RELAY4, RELAY_OFF);
 
   // ================= BUZZER SETUP =================
   pinMode(BUZZER_PIN, OUTPUT);
