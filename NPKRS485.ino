@@ -3,6 +3,8 @@
 #include <PubSubClient.h>
 #include <ModbusMaster.h>
 #include <ArduinoJson.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
 
 // ================= WIFI =================
 const char* ssid = "halal";
@@ -21,6 +23,13 @@ PubSubClient client(espClient);
 
 // Inisialisasi Modbus
 ModbusMaster node;
+
+// ================= I2C LCD =================
+#define LCD_ADDRESS 0x27
+#define LCD_COLUMNS 20
+#define LCD_ROWS 4
+
+LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLUMNS, LCD_ROWS);
 
 // Control Pin MAX485
 #define MAX485_DE_RE 4
@@ -52,6 +61,15 @@ unsigned long lastReadTime = 0;
 const unsigned long READ_INTERVAL = 2000;
 const unsigned long SENSOR_DELAY = 100;
 bool sensorReadSuccess = true;
+
+const unsigned long WIFI_RETRY_INTERVAL = 15000;
+const unsigned long MQTT_RETRY_INTERVAL = 5000;
+const unsigned long STARTUP_SCREEN_DURATION = 10000;
+const unsigned long STARTUP_ANIMATION_INTERVAL = 500;
+
+unsigned long lastWifiAttemptTime = 0;
+unsigned long lastMqttAttemptTime = 0;
+bool wifiStarted = false;
 
 // ================= NUTRITION THRESHOLD =================
 float MIN_NITROGEN = 40;
@@ -91,6 +109,112 @@ void preTransmission() {
 
 void postTransmission() {
   digitalWrite(MAX485_DE_RE, LOW);
+}
+
+void printPaddedLcdLine(byte row, const String &text) {
+  lcd.setCursor(0, row);
+  lcd.print(text);
+
+  for (int i = text.length(); i < LCD_COLUMNS; i++) {
+    lcd.print(' ');
+  }
+}
+
+void printCenteredLcdLine(byte row, const String &text) {
+  int leftPadding = (LCD_COLUMNS - text.length()) / 2;
+
+  if (leftPadding < 0) {
+    leftPadding = 0;
+  }
+
+  String line = "";
+
+  for (int i = 0; i < leftPadding; i++) {
+    line += ' ';
+  }
+
+  line += text;
+  printPaddedLcdLine(row, line);
+}
+
+String formatLcdValue(float value, unsigned int decimals) {
+  String formatted = String(value, decimals);
+
+  if (formatted.length() > 4) {
+    formatted = String(value, 0);
+  }
+
+  if (formatted.length() > 4) {
+    formatted = formatted.substring(0, 4);
+  }
+
+  return formatted;
+}
+
+void clearLcdLine(byte row) {
+  lcd.setCursor(0, row);
+
+  for (int i = 0; i < LCD_COLUMNS; i++) {
+    lcd.print(' ');
+  }
+}
+
+void setupLcd() {
+  lcd.init();
+  lcd.backlight();
+}
+
+void showStartupScreen() {
+  unsigned long startedAt = millis();
+  byte frame = 0;
+
+  printCenteredLcdLine(0, "NutriXense");
+  printCenteredLcdLine(1, "Smart Nutrient");
+  printCenteredLcdLine(2, "Monitoring");
+
+  while (millis() - startedAt < STARTUP_SCREEN_DURATION) {
+    String loadingText = "Starting";
+
+    for (byte i = 0; i < frame; i++) {
+      loadingText += " .";
+    }
+
+    printCenteredLcdLine(3, loadingText);
+    frame = (frame + 1) % 4;
+    delay(STARTUP_ANIMATION_INTERVAL);
+  }
+
+  lcd.clear();
+}
+
+void displaySensorData(float nitrogen, float phosphorus, float potassium, float ph, float moisture, float temperature) {
+  printCenteredLcdLine(0, "NutriXense");
+
+  printPaddedLcdLine(
+    1,
+    "N:" + formatLcdValue(nitrogen, 0) + " mg/kg pH:" + formatLcdValue(ph, 1)
+  );
+
+  clearLcdLine(2);
+  lcd.setCursor(0, 2);
+  lcd.print("P:");
+  lcd.print(formatLcdValue(phosphorus, 0));
+  lcd.print(" mg/kg T:");
+  lcd.print(formatLcdValue(temperature, 1));
+  lcd.write(byte(223));
+  lcd.print("C");
+
+  printPaddedLcdLine(
+    3,
+    "K:" + formatLcdValue(potassium, 0) + " mg/kg M:" + formatLcdValue(moisture, 1) + "%"
+  );
+}
+
+void displaySensorError() {
+  printPaddedLcdLine(0, "     NutriXense");
+  printPaddedLcdLine(1, " Sensor read failed");
+  printPaddedLcdLine(2, " Check RS485/NPK");
+  printPaddedLcdLine(3, " Retrying...");
 }
 
 void printThresholds() {
@@ -194,36 +318,52 @@ void printThresholdCheck(float nitrogen, float phosphorus, float potassium, floa
 
 // ================= WIFI =================
 void setup_wifi() {
-  Serial.print("Connecting WiFi...");
+  Serial.println("Starting WiFi connection attempt...");
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  Serial.println("\nWiFi Connected!");
+  wifiStarted = true;
+  lastWifiAttemptTime = millis();
 }
 
 // ================= MQTT CONNECT =================
 void reconnect() {
-  while (!client.connected()) {
-    Serial.print("Connecting MQTT...");
+  if (WiFi.status() != WL_CONNECTED || client.connected()) {
+    return;
+  }
 
-    if (client.connect("ESP32_Client", mqtt_user, mqtt_pass)) {
-      Serial.println("Connected!");
+  lastMqttAttemptTime = millis();
+  Serial.print("Connecting MQTT...");
 
-      client.subscribe("nutrixense/control");
-      Serial.println("Subscribed: nutrixense/control");
+  if (client.connect("ESP32_Client", mqtt_user, mqtt_pass)) {
+    Serial.println("Connected!");
 
-      client.subscribe("nutrixense/config");
-      Serial.println("Subscribed: nutrixense/config");
-    } else {
-      Serial.print("Failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" retrying...");
-      delay(2000);
+    client.subscribe("nutrixense/control");
+    Serial.println("Subscribed: nutrixense/control");
+
+    client.subscribe("nutrixense/config");
+    Serial.println("Subscribed: nutrixense/config");
+  } else {
+    Serial.print("Failed, rc=");
+    Serial.print(client.state());
+    Serial.println(" will retry later.");
+  }
+}
+
+void maintainNetwork() {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (!wifiStarted || millis() - lastWifiAttemptTime >= WIFI_RETRY_INTERVAL) {
+      setup_wifi();
     }
+
+    return;
+  }
+
+  if (!client.connected() && millis() - lastMqttAttemptTime >= MQTT_RETRY_INTERVAL) {
+    reconnect();
+  }
+
+  if (client.connected()) {
+    client.loop();
   }
 }
 
@@ -433,6 +573,10 @@ void setup() {
   // Buzzer awal mati
   digitalWrite(BUZZER_PIN, BUZZER_OFF);
 
+  // ================= LCD SETUP =================
+  setupLcd();
+  showStartupScreen();
+
   // Setup pin MAX485
   pinMode(MAX485_DE_RE, OUTPUT);
   digitalWrite(MAX485_DE_RE, LOW);
@@ -459,11 +603,7 @@ void setup() {
 }
 
 void loop() {
-  if (!client.connected()) {
-    reconnect();
-  }
-
-  client.loop();
+  maintainNetwork();
 
   if (millis() - lastReadTime >= READ_INTERVAL) {
     Serial.println("\n===== READING SENSOR =====");
@@ -546,10 +686,20 @@ void loop() {
       Serial.println("Skipping threshold check...");
 
       digitalWrite(BUZZER_PIN, BUZZER_OFF);
+      displaySensorError();
 
       lastReadTime = millis();
       return;
     }
+
+    displaySensorData(
+      nitrogen,
+      phosphorus,
+      potassium,
+      ph,
+      moisture,
+      temperature
+    );
 
     printThresholdCheck(
       nitrogen,
@@ -602,13 +752,17 @@ void loop() {
 
     payload += "}";
 
-    Serial.println("Sending MQTT:");
-    Serial.println(payload);
+    if (client.connected()) {
+      Serial.println("Sending MQTT:");
+      Serial.println(payload);
 
-    if (client.publish(topic, payload.c_str())) {
-      Serial.println("MQTT Publish Success");
+      if (client.publish(topic, payload.c_str())) {
+        Serial.println("MQTT Publish Success");
+      } else {
+        Serial.println("MQTT Publish Failed");
+      }
     } else {
-      Serial.println("MQTT Publish Failed");
+      Serial.println("MQTT offline. Sensor data shown on LCD only.");
     }
 
     lastReadTime = millis();
