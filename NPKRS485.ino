@@ -72,6 +72,19 @@ float MAX_MOISTURE = 80.0;
 float MAX_TEMPERATURE = 35.0;
 float MAX_EC = 3.0;
 
+// ================= BUZZER MUTE CONFIG =================
+bool MUTE_NITROGEN = false;
+bool MUTE_PHOSPHORUS = false;
+bool MUTE_POTASSIUM = false;
+bool MUTE_PH = false;
+bool MUTE_MOISTURE = false;
+bool MUTE_TEMPERATURE = false;
+bool MUTE_EC = false;
+
+bool isActiveAbnormal(float value, float minValue, float maxValue, bool muted) {
+  return !muted && (value < minValue || value > maxValue);
+}
+
 void preTransmission() {
   digitalWrite(MAX485_DE_RE, HIGH);
 }
@@ -81,7 +94,6 @@ void postTransmission() {
 }
 
 void printThresholds() {
-
   Serial.println("===== CURRENT THRESHOLDS =====");
 
   Serial.print("Nitrogen     : ");
@@ -120,16 +132,7 @@ void printThresholds() {
   Serial.println(MAX_EC);
 }
 
-void printThresholdCheck(
-  float nitrogen,
-  float phosphorus,
-  float potassium,
-  float ph,
-  float moisture,
-  float temperature,
-  float ec
-) {
-
+void printThresholdCheck(float nitrogen, float phosphorus, float potassium, float ph, float moisture, float temperature, float ec) {
   Serial.println("===== DEBUG THRESHOLD CHECK =====");
 
   Serial.print("Nitrogen     : ");
@@ -226,7 +229,6 @@ void reconnect() {
 
 // ================= READ REGISTER =================
 uint16_t readRegister(uint16_t reg, bool &success) {
-
   uint8_t result = node.readHoldingRegisters(reg, 1);
 
   if (result == node.ku8MBSuccess) {
@@ -375,6 +377,18 @@ void callback(char* topic, byte* payload, unsigned int length) {
     Serial.println("=== THRESHOLD UPDATED ===");
     printThresholds();
 
+    if (doc.containsKey("buzzer_muted")) {
+      JsonObject muted = doc["buzzer_muted"];
+
+      if (muted.containsKey("nitrogen")) MUTE_NITROGEN = muted["nitrogen"].as<bool>();
+      if (muted.containsKey("phosphorus")) MUTE_PHOSPHORUS = muted["phosphorus"].as<bool>();
+      if (muted.containsKey("potassium")) MUTE_POTASSIUM = muted["potassium"].as<bool>();
+      if (muted.containsKey("ph")) MUTE_PH = muted["ph"].as<bool>();
+      if (muted.containsKey("moisture")) MUTE_MOISTURE = muted["moisture"].as<bool>();
+      if (muted.containsKey("temperature")) MUTE_TEMPERATURE = muted["temperature"].as<bool>();
+      if (muted.containsKey("ec")) MUTE_EC = muted["ec"].as<bool>();
+    }
+
     if (
       MIN_NITROGEN <= 0 &&
       MIN_PHOSPHORUS <= 0 &&
@@ -467,7 +481,6 @@ void loop() {
     float potassium = 0;
 
     if (result == node.ku8MBSuccess) {
-
       moisture =
         node.getResponseBuffer(0) / 10.0;
 
@@ -478,7 +491,7 @@ void loop() {
         tempRaw / 10.0;
 
       ec =
-        node.getResponseBuffer(2) / 100.0;
+        node.getResponseBuffer(2) / 1000.0;
 
       ph =
         node.getResponseBuffer(3) / 10.0;
@@ -493,9 +506,7 @@ void loop() {
         node.getResponseBuffer(6);
 
     } else {
-
       sensorReadSuccess = false;
-
       Serial.println("FAILED reading sensor registers!");
     }
 
@@ -531,7 +542,6 @@ void loop() {
     Serial.println("==========================");
 
     if (!sensorReadSuccess) {
-
       Serial.println("Sensor read failed!");
       Serial.println("Skipping threshold check...");
 
@@ -552,24 +562,13 @@ void loop() {
     );
 
     bool nutrientAbnormal =
-
-      // BELOW MIN
-      (nitrogen < MIN_NITROGEN) ||
-      (phosphorus < MIN_PHOSPHORUS) ||
-      (potassium < MIN_POTASSIUM) ||
-      (ph < MIN_PH) ||
-      (moisture < MIN_MOISTURE) ||
-      (temperature < MIN_TEMPERATURE) ||
-      (ec < MIN_EC) ||
-
-      // ABOVE MAX
-      (nitrogen > MAX_NITROGEN) ||
-      (phosphorus > MAX_PHOSPHORUS) ||
-      (potassium > MAX_POTASSIUM) ||
-      (ph > MAX_PH) ||
-      (moisture > MAX_MOISTURE) ||
-      (temperature > MAX_TEMPERATURE) ||
-      (ec > MAX_EC);
+     isActiveAbnormal(nitrogen, MIN_NITROGEN, MAX_NITROGEN, MUTE_NITROGEN) ||
+     isActiveAbnormal(phosphorus, MIN_PHOSPHORUS, MAX_PHOSPHORUS, MUTE_PHOSPHORUS) ||
+     isActiveAbnormal(potassium, MIN_POTASSIUM, MAX_POTASSIUM, MUTE_POTASSIUM) ||
+     isActiveAbnormal(ph, MIN_PH, MAX_PH, MUTE_PH) ||
+     isActiveAbnormal(moisture, MIN_MOISTURE, MAX_MOISTURE, MUTE_MOISTURE) ||
+     isActiveAbnormal(temperature, MIN_TEMPERATURE, MAX_TEMPERATURE, MUTE_TEMPERATURE) ||
+     isActiveAbnormal(ec, MIN_EC, MAX_EC, MUTE_EC);
 
     Serial.print("nutrientAbnormal = ");
     Serial.println(nutrientAbnormal ? "TRUE" : "FALSE");
