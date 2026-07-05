@@ -49,7 +49,7 @@ LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLUMNS, LCD_ROWS);
 #define RELAY_ON HIGH
 
 // ================= BUZZER =================
-#define BUZZER_PIN 12
+#define BUZZER_PIN 18
 
 // If your buzzer still sounds when it should be OFF,
 // swap these two values.
@@ -64,12 +64,71 @@ bool sensorReadSuccess = true;
 
 const unsigned long WIFI_RETRY_INTERVAL = 15000;
 const unsigned long MQTT_RETRY_INTERVAL = 5000;
-const unsigned long STARTUP_SCREEN_DURATION = 10000;
+const unsigned long STARTUP_SCREEN_DURATION = 3000;
 const unsigned long STARTUP_ANIMATION_INTERVAL = 500;
+const unsigned long LCD_SENSOR_SCREEN_DURATION = 10000;
+const unsigned long LCD_TIME_SCREEN_DURATION = 3000;
+const unsigned long BUZZER_ALERT_INTERVAL = 30000;
+const unsigned long BUZZER_BEEP_INTERVAL = 180;
+const byte BUZZER_ALERT_TOGGLES = 6;
 
 unsigned long lastWifiAttemptTime = 0;
 unsigned long lastMqttAttemptTime = 0;
 bool wifiStarted = false;
+
+unsigned long lcdScreenStartedAt = 0;
+bool showSensorScreen = true;
+
+unsigned long lastBuzzerAlertTime = 0;
+unsigned long lastBuzzerToggleTime = 0;
+byte buzzerToggleCount = 0;
+bool buzzerAlertActive = false;
+bool buzzerOutputState = false;
+
+bool currentNutrientAbnormal = false;
+bool hasValidSensorData = false;
+
+float lastMoisture = 0;
+float lastTemperature = 0;
+float lastEc = 0;
+float lastPh = 0;
+float lastNitrogen = 0;
+float lastPhosphorus = 0;
+float lastPotassium = 0;
+
+struct RtcDateTime {
+  int year;
+  byte month;
+  byte day;
+  byte hour;
+  byte minute;
+  byte second;
+  byte dayOfWeek;
+  bool valid;
+};
+
+RtcDateTime softwareClockBase;
+unsigned long softwareClockSetMillis = 0;
+bool softwareClockValid = false;
+
+struct RelaySchedule {
+  bool enabled;
+  byte relay;
+  int startYear;
+  byte startMonth;
+  byte startDay;
+  int endYear;
+  byte endMonth;
+  byte endDay;
+  byte hour;
+  byte minute;
+  unsigned int durationSeconds;
+  byte daysMask;
+  bool activeToday;
+};
+
+const byte MAX_SCHEDULES = 4;
+RelaySchedule relaySchedules[MAX_SCHEDULES];
 
 // ================= NUTRITION THRESHOLD =================
 float MIN_NITROGEN = 40;
@@ -151,6 +210,28 @@ String formatLcdValue(float value, unsigned int decimals) {
   return formatted;
 }
 
+String formatNpkValue(float value) {
+  String formatted = String((int)round(value));
+
+  while (formatted.length() < 3) {
+    formatted = " " + formatted;
+  }
+
+  if (formatted.length() > 3) {
+    formatted = formatted.substring(0, 3);
+  }
+
+  return formatted;
+}
+
+String twoDigits(byte value) {
+  if (value < 10) {
+    return "0" + String(value);
+  }
+
+  return String(value);
+}
+
 void clearLcdLine(byte row) {
   lcd.setCursor(0, row);
 
@@ -192,13 +273,13 @@ void displaySensorData(float nitrogen, float phosphorus, float potassium, float 
 
   printPaddedLcdLine(
     1,
-    "N:" + formatLcdValue(nitrogen, 0) + " mg/kg pH:" + formatLcdValue(ph, 1)
+    "N:" + formatNpkValue(nitrogen) + " mg/kg pH:" + formatLcdValue(ph, 1)
   );
 
   clearLcdLine(2);
   lcd.setCursor(0, 2);
   lcd.print("P:");
-  lcd.print(formatLcdValue(phosphorus, 0));
+  lcd.print(formatNpkValue(phosphorus));
   lcd.print(" mg/kg T:");
   lcd.print(formatLcdValue(temperature, 1));
   lcd.write(byte(223));
@@ -206,7 +287,41 @@ void displaySensorData(float nitrogen, float phosphorus, float potassium, float 
 
   printPaddedLcdLine(
     3,
-    "K:" + formatLcdValue(potassium, 0) + " mg/kg M:" + formatLcdValue(moisture, 1) + "%"
+    "K:" + formatNpkValue(potassium) + " mg/kg M:" + formatLcdValue(moisture, 1) + "%"
+  );
+}
+
+const char* dayName(byte dayOfWeek) {
+  switch (dayOfWeek) {
+    case 1: return "Minggu";
+    case 2: return "Senin";
+    case 3: return "Selasa";
+    case 4: return "Rabu";
+    case 5: return "Kamis";
+    case 6: return "Jumat";
+    case 7: return "Sabtu";
+    default: return "Hari";
+  }
+}
+
+void displayTimeData(const RtcDateTime &now) {
+  if (!now.valid) {
+    printCenteredLcdLine(0, "NutriXense");
+    printCenteredLcdLine(1, "Waktu belum set");
+    printCenteredLcdLine(2, "Hubungkan MQTT");
+    printCenteredLcdLine(3, "Set via Android");
+    return;
+  }
+
+  printCenteredLcdLine(0, "NutriXense");
+  printCenteredLcdLine(1, dayName(now.dayOfWeek));
+  printCenteredLcdLine(
+    2,
+    twoDigits(now.day) + "/" + twoDigits(now.month) + "/" + String(now.year)
+  );
+  printCenteredLcdLine(
+    3,
+    twoDigits(now.hour) + ":" + twoDigits(now.minute) + ":" + twoDigits(now.second)
   );
 }
 
@@ -215,6 +330,198 @@ void displaySensorError() {
   printPaddedLcdLine(1, " Sensor read failed");
   printPaddedLcdLine(2, " Check RS485/NPK");
   printPaddedLcdLine(3, " Retrying...");
+}
+
+bool isLeapYear(int year) {
+  return (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+}
+
+byte daysInMonth(int year, byte month) {
+  switch (month) {
+    case 2: return isLeapYear(year) ? 29 : 28;
+    case 4:
+    case 6:
+    case 9:
+    case 11:
+      return 30;
+    default:
+      return 31;
+  }
+}
+
+void incrementDate(RtcDateTime &dateTime) {
+  dateTime.day++;
+  dateTime.dayOfWeek++;
+
+  if (dateTime.dayOfWeek > 7) {
+    dateTime.dayOfWeek = 1;
+  }
+
+  if (dateTime.day > daysInMonth(dateTime.year, dateTime.month)) {
+    dateTime.day = 1;
+    dateTime.month++;
+
+    if (dateTime.month > 12) {
+      dateTime.month = 1;
+      dateTime.year++;
+    }
+  }
+}
+
+RtcDateTime advanceDateTime(RtcDateTime dateTime, unsigned long elapsedSeconds) {
+  unsigned long secondsOfDay =
+    (dateTime.hour * 3600UL) + (dateTime.minute * 60UL) + dateTime.second;
+  unsigned long totalSeconds = secondsOfDay + elapsedSeconds;
+
+  while (totalSeconds >= 86400UL) {
+    totalSeconds -= 86400UL;
+    incrementDate(dateTime);
+  }
+
+  dateTime.hour = totalSeconds / 3600UL;
+  totalSeconds %= 3600UL;
+  dateTime.minute = totalSeconds / 60UL;
+  dateTime.second = totalSeconds % 60UL;
+  dateTime.valid = true;
+
+  return dateTime;
+}
+
+void setSoftwareClock(const RtcDateTime &dateTime) {
+  softwareClockBase = dateTime;
+  softwareClockBase.valid = true;
+  softwareClockSetMillis = millis();
+  softwareClockValid = true;
+}
+
+RtcDateTime readSoftwareClock() {
+  RtcDateTime now = softwareClockBase;
+
+  if (!softwareClockValid) {
+    now.valid = false;
+    return now;
+  }
+
+  return advanceDateTime(now, (millis() - softwareClockSetMillis) / 1000UL);
+}
+
+RtcDateTime readCurrentDateTime() {
+  return readSoftwareClock();
+}
+
+int dateKey(int year, byte month, byte day) {
+  return (year * 10000) + (month * 100) + day;
+}
+
+bool isScheduleDayActive(const RelaySchedule &schedule, byte dayOfWeek) {
+  if (schedule.daysMask == 0) {
+    return true;
+  }
+
+  return schedule.daysMask & (1 << (dayOfWeek - 1));
+}
+
+bool isScheduleActiveNow(const RelaySchedule &schedule, const RtcDateTime &now) {
+  if (!schedule.enabled || !now.valid || schedule.relay < 1 || schedule.relay > 4) {
+    return false;
+  }
+
+  int today = dateKey(now.year, now.month, now.day);
+  int startDate = dateKey(schedule.startYear, schedule.startMonth, schedule.startDay);
+  int endDate = dateKey(schedule.endYear, schedule.endMonth, schedule.endDay);
+
+  if (today < startDate || today > endDate || !isScheduleDayActive(schedule, now.dayOfWeek)) {
+    return false;
+  }
+
+  unsigned long nowSeconds = (now.hour * 3600UL) + (now.minute * 60UL) + now.second;
+  unsigned long startSeconds = (schedule.hour * 3600UL) + (schedule.minute * 60UL);
+  unsigned long endSeconds = startSeconds + schedule.durationSeconds;
+
+  return nowSeconds >= startSeconds && nowSeconds < endSeconds;
+}
+
+int relayPin(byte relay) {
+  switch (relay) {
+    case 1: return RELAY1;
+    case 2: return RELAY2;
+    case 3: return RELAY3;
+    case 4: return RELAY4;
+    default: return -1;
+  }
+}
+
+void applyRelaySchedules(const RtcDateTime &now) {
+  bool relayAutoActive[4] = { false, false, false, false };
+  bool relayConfigured[4] = { false, false, false, false };
+
+  for (byte i = 0; i < MAX_SCHEDULES; i++) {
+    RelaySchedule &schedule = relaySchedules[i];
+
+    if (schedule.enabled && schedule.relay >= 1 && schedule.relay <= 4) {
+      relayConfigured[schedule.relay - 1] = true;
+
+      if (isScheduleActiveNow(schedule, now)) {
+        relayAutoActive[schedule.relay - 1] = true;
+      }
+    }
+  }
+
+  for (byte i = 0; i < 4; i++) {
+    if (relayConfigured[i]) {
+      digitalWrite(relayPin(i + 1), relayAutoActive[i] ? RELAY_ON : RELAY_OFF);
+    }
+  }
+}
+
+void maintainLcdDisplay() {
+  unsigned long duration = showSensorScreen ? LCD_SENSOR_SCREEN_DURATION : LCD_TIME_SCREEN_DURATION;
+
+  if (millis() - lcdScreenStartedAt >= duration) {
+    showSensorScreen = !showSensorScreen;
+    lcdScreenStartedAt = millis();
+  }
+
+  if (showSensorScreen) {
+    if (hasValidSensorData) {
+      displaySensorData(lastNitrogen, lastPhosphorus, lastPotassium, lastPh, lastMoisture, lastTemperature);
+    } else {
+      displaySensorError();
+    }
+  } else {
+    displayTimeData(readCurrentDateTime());
+  }
+}
+
+void maintainBuzzer(bool nutrientAbnormal) {
+  if (!nutrientAbnormal) {
+    buzzerAlertActive = false;
+    buzzerToggleCount = 0;
+    buzzerOutputState = false;
+    digitalWrite(BUZZER_PIN, BUZZER_OFF);
+    return;
+  }
+
+  if (!buzzerAlertActive && millis() - lastBuzzerAlertTime >= BUZZER_ALERT_INTERVAL) {
+    buzzerAlertActive = true;
+    buzzerToggleCount = 0;
+    buzzerOutputState = false;
+    lastBuzzerToggleTime = millis();
+    lastBuzzerAlertTime = millis();
+  }
+
+  if (buzzerAlertActive && millis() - lastBuzzerToggleTime >= BUZZER_BEEP_INTERVAL) {
+    buzzerOutputState = !buzzerOutputState;
+    digitalWrite(BUZZER_PIN, buzzerOutputState ? BUZZER_ON : BUZZER_OFF);
+    buzzerToggleCount++;
+    lastBuzzerToggleTime = millis();
+
+    if (buzzerToggleCount >= BUZZER_ALERT_TOGGLES) {
+      buzzerAlertActive = false;
+      buzzerOutputState = false;
+      digitalWrite(BUZZER_PIN, BUZZER_OFF);
+    }
+  }
 }
 
 void printThresholds() {
@@ -342,6 +649,9 @@ void reconnect() {
 
     client.subscribe("nutrixense/config");
     Serial.println("Subscribed: nutrixense/config");
+
+    client.subscribe("nutrixense/schedule");
+    Serial.println("Subscribed: nutrixense/schedule");
   } else {
     Serial.print("Failed, rc=");
     Serial.print(client.state());
@@ -382,6 +692,136 @@ uint16_t readRegister(uint16_t reg, bool &success) {
   Serial.println(reg, HEX);
 
   return 0;
+}
+
+byte calculateDayOfWeek(int year, byte month, byte day) {
+  if (month < 3) {
+    month += 12;
+    year--;
+  }
+
+  int k = year % 100;
+  int j = year / 100;
+  int h = (day + ((13 * (month + 1)) / 5) + k + (k / 4) + (j / 4) + (5 * j)) % 7;
+
+  return ((h + 6) % 7) + 1;
+}
+
+bool parseDateString(const char* dateText, int &year, byte &month, byte &day) {
+  if (dateText == nullptr || strlen(dateText) < 10) {
+    return false;
+  }
+
+  String value = String(dateText);
+  year = value.substring(0, 4).toInt();
+  month = value.substring(5, 7).toInt();
+  day = value.substring(8, 10).toInt();
+
+  return year >= 2024 && month >= 1 && month <= 12 && day >= 1 && day <= 31;
+}
+
+bool parseTimeString(const char* timeText, byte &hour, byte &minute) {
+  if (timeText == nullptr || strlen(timeText) < 5) {
+    return false;
+  }
+
+  String value = String(timeText);
+  hour = value.substring(0, 2).toInt();
+  minute = value.substring(3, 5).toInt();
+
+  return hour <= 23 && minute <= 59;
+}
+
+byte parseDaysMask(JsonVariant days) {
+  if (!days.is<JsonArray>()) {
+    return 0;
+  }
+
+  byte mask = 0;
+
+  for (JsonVariant day : days.as<JsonArray>()) {
+    byte dayOfWeek = day.as<byte>();
+
+    if (dayOfWeek >= 1 && dayOfWeek <= 7) {
+      mask |= (1 << (dayOfWeek - 1));
+    }
+  }
+
+  return mask;
+}
+
+void updateRtcFromJson(JsonObject rtcConfig) {
+  if (rtcConfig.isNull()) {
+    return;
+  }
+
+  RtcDateTime dateTime;
+  dateTime.year = rtcConfig["year"] | 0;
+  dateTime.month = rtcConfig["month"] | 0;
+  dateTime.day = rtcConfig["day"] | 0;
+  dateTime.hour = rtcConfig["hour"] | 0;
+  dateTime.minute = rtcConfig["minute"] | 0;
+  dateTime.second = rtcConfig["second"] | 0;
+  dateTime.dayOfWeek = rtcConfig["day_of_week"] | 0;
+
+  if (dateTime.dayOfWeek < 1 || dateTime.dayOfWeek > 7) {
+    dateTime.dayOfWeek = calculateDayOfWeek(dateTime.year, dateTime.month, dateTime.day);
+  }
+
+  dateTime.valid =
+    dateTime.year >= 2024 &&
+    dateTime.month >= 1 && dateTime.month <= 12 &&
+    dateTime.day >= 1 && dateTime.day <= 31 &&
+    dateTime.hour <= 23 &&
+    dateTime.minute <= 59 &&
+    dateTime.second <= 59;
+
+  if (dateTime.valid) {
+    setSoftwareClock(dateTime);
+    Serial.println("System time updated from Android MQTT payload.");
+  } else {
+    Serial.println("Invalid time payload. System time not updated.");
+  }
+}
+
+void updateSchedulesFromJson(JsonArray schedules) {
+  for (byte i = 0; i < MAX_SCHEDULES; i++) {
+    relaySchedules[i].enabled = false;
+  }
+
+  if (schedules.isNull()) {
+    return;
+  }
+
+  byte index = 0;
+
+  for (JsonObject item : schedules) {
+    if (index >= MAX_SCHEDULES) {
+      break;
+    }
+
+    RelaySchedule &schedule = relaySchedules[index];
+    schedule.enabled = item["enabled"] | true;
+    schedule.relay = item["relay"] | 1;
+    schedule.durationSeconds = item["duration_seconds"] | 5;
+    schedule.daysMask = parseDaysMask(item["days"]);
+
+    const char* startDateText = item["start_date"] | "2024-01-01";
+    const char* endDateText = item["end_date"] | "2099-12-31";
+    const char* timeText = item["time"] | "06:00";
+
+    bool validStartDate = parseDateString(startDateText, schedule.startYear, schedule.startMonth, schedule.startDay);
+    bool validEndDate = parseDateString(endDateText, schedule.endYear, schedule.endMonth, schedule.endDay);
+    bool validTime = parseTimeString(timeText, schedule.hour, schedule.minute);
+
+    if (!validStartDate || !validEndDate || !validTime || schedule.relay < 1 || schedule.relay > 4) {
+      schedule.enabled = false;
+    }
+
+    index++;
+  }
+
+  Serial.println("Relay schedules updated from Android.");
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
@@ -450,6 +890,23 @@ void callback(char* topic, byte* payload, unsigned int length) {
       Serial.print("Relay4: ");
       Serial.println(state ? "ON" : "OFF");
     }
+  }
+
+  // =====================================================
+  // MQTT TOPIC : nutrixense/schedule
+  // Payload example:
+  // {
+  //   "rtc": {"year":2026,"month":7,"day":2,"hour":6,"minute":30,"second":0},
+  //   "schedules": [
+  //     {"enabled":true,"relay":1,"start_date":"2026-07-02","end_date":"2026-12-31","time":"06:30","duration_seconds":5,"days":[2,3,4,5,6]}
+  //   ]
+  // }
+  // =====================================================
+  else if (topicStr == "nutrixense/schedule") {
+    Serial.println("=== SCHEDULE CONFIG ===");
+
+    updateRtcFromJson(doc["rtc"].as<JsonObject>());
+    updateSchedulesFromJson(doc["schedules"].as<JsonArray>());
   }
 
   // =====================================================
@@ -572,10 +1029,12 @@ void setup() {
 
   // Buzzer awal mati
   digitalWrite(BUZZER_PIN, BUZZER_OFF);
+  lastBuzzerAlertTime = millis() - BUZZER_ALERT_INTERVAL;
 
   // ================= LCD SETUP =================
   setupLcd();
   showStartupScreen();
+  lcdScreenStartedAt = millis();
 
   // Setup pin MAX485
   pinMode(MAX485_DE_RE, OUTPUT);
@@ -604,6 +1063,10 @@ void setup() {
 
 void loop() {
   maintainNetwork();
+  RtcDateTime now = readCurrentDateTime();
+  applyRelaySchedules(now);
+  maintainLcdDisplay();
+  maintainBuzzer(currentNutrientAbnormal);
 
   if (millis() - lastReadTime >= READ_INTERVAL) {
     Serial.println("\n===== READING SENSOR =====");
@@ -685,21 +1148,21 @@ void loop() {
       Serial.println("Sensor read failed!");
       Serial.println("Skipping threshold check...");
 
-      digitalWrite(BUZZER_PIN, BUZZER_OFF);
-      displaySensorError();
+      currentNutrientAbnormal = false;
+      hasValidSensorData = false;
 
       lastReadTime = millis();
       return;
     }
 
-    displaySensorData(
-      nitrogen,
-      phosphorus,
-      potassium,
-      ph,
-      moisture,
-      temperature
-    );
+    lastMoisture = moisture;
+    lastTemperature = temperature;
+    lastEc = ec;
+    lastPh = ph;
+    lastNitrogen = nitrogen;
+    lastPhosphorus = phosphorus;
+    lastPotassium = potassium;
+    hasValidSensorData = true;
 
     printThresholdCheck(
       nitrogen,
@@ -722,15 +1185,12 @@ void loop() {
 
     Serial.print("nutrientAbnormal = ");
     Serial.println(nutrientAbnormal ? "TRUE" : "FALSE");
+    currentNutrientAbnormal = nutrientAbnormal;
 
     if (nutrientAbnormal) {
-      digitalWrite(BUZZER_PIN, BUZZER_ON);
-
       Serial.println("WARNING: Nutrisi di bawah ambang normal!");
-      Serial.println("Buzzer ON");
+      Serial.println("Buzzer beep pattern armed");
     } else {
-      digitalWrite(BUZZER_PIN, BUZZER_OFF);
-
       Serial.println("Nutrisi Normal");
       Serial.println("Buzzer OFF");
     }
