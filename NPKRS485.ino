@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <WiFiManager.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <ModbusMaster.h>
@@ -7,8 +8,9 @@
 #include <LiquidCrystal_I2C.h>
 
 // ================= WIFI =================
-const char* ssid = "halal";
-const char* password = "MAU MASUK SURGA ibadah";
+const char* WIFI_MANAGER_AP_NAME = "NutriXense";
+const char* WIFI_MANAGER_AP_PASSWORD = "12345678";
+WiFiManager wifiManager;
 
 // ================= HIVEMQ =================
 const char* mqtt_server = "a8805b4f45744c3f9ac83882e423e0c0.s1.eu.hivemq.cloud";
@@ -30,6 +32,16 @@ ModbusMaster node;
 #define LCD_ROWS 4
 
 LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLUMNS, LCD_ROWS);
+
+// ================= RTC DS3231 + EEPROM AT24C32 =================
+#define I2C_SDA_PIN 21
+#define I2C_SCL_PIN 22
+#define DS3231_ADDRESS 0x68
+#define AT24C32_ADDRESS 0x57
+#define AT24C32_PAGE_SIZE 32
+
+bool ds3231Available = false;
+bool at24c32Available = false;
 
 // Control Pin MAX485
 #define MAX485_DE_RE 4
@@ -63,6 +75,7 @@ const unsigned long SENSOR_DELAY = 100;
 bool sensorReadSuccess = true;
 
 const unsigned long WIFI_RETRY_INTERVAL = 15000;
+const unsigned long WIFI_CONNECT_TIMEOUT_SECONDS = 5;
 const unsigned long MQTT_RETRY_INTERVAL = 5000;
 const unsigned long STARTUP_SCREEN_DURATION = 3000;
 const unsigned long STARTUP_ANIMATION_INTERVAL = 500;
@@ -70,11 +83,13 @@ const unsigned long LCD_SENSOR_SCREEN_DURATION = 10000;
 const unsigned long LCD_TIME_SCREEN_DURATION = 3000;
 const unsigned long BUZZER_ALERT_INTERVAL = 30000;
 const unsigned long BUZZER_BEEP_INTERVAL = 180;
-const byte BUZZER_ALERT_TOGGLES = 6;
+const byte BUZZER_ALERT_TOGGLES = 10;
 
 unsigned long lastWifiAttemptTime = 0;
 unsigned long lastMqttAttemptTime = 0;
 bool wifiStarted = false;
+bool wifiManagerPortalRunning = false;
+bool wifiConnectedLogged = false;
 
 unsigned long lcdScreenStartedAt = 0;
 bool showSensorScreen = true;
@@ -129,6 +144,22 @@ struct RelaySchedule {
 
 const byte MAX_SCHEDULES = 4;
 RelaySchedule relaySchedules[MAX_SCHEDULES];
+
+bool manualOverrideActive[4] = { false, false, false, false };
+bool manualOverrideState[4] = { false, false, false, false };
+bool lastScheduleAutoActive[4] = { false, false, false, false };
+
+const byte SCHEDULE_STORAGE_MAGIC_0 = 'N';
+const byte SCHEDULE_STORAGE_MAGIC_1 = 'X';
+const byte SCHEDULE_STORAGE_MAGIC_2 = 'S';
+const byte SCHEDULE_STORAGE_MAGIC_3 = '1';
+const byte SCHEDULE_STORAGE_VERSION = 1;
+const byte SCHEDULE_STORAGE_HEADER_BYTES = 8;
+const byte SCHEDULE_STORAGE_RECORD_BYTES = 16;
+const uint16_t SCHEDULE_STORAGE_ADDRESS = 0;
+const uint16_t SCHEDULE_STORAGE_TOTAL_BYTES =
+  SCHEDULE_STORAGE_HEADER_BYTES + (MAX_SCHEDULES * SCHEDULE_STORAGE_RECORD_BYTES);
+const byte SCHEDULE_STORAGE_CHECKSUM_INDEX = 7;
 
 // ================= NUTRITION THRESHOLD =================
 float MIN_NITROGEN = 40;
@@ -349,6 +380,121 @@ byte daysInMonth(int year, byte month) {
   }
 }
 
+bool isValidDateTime(const RtcDateTime &dateTime) {
+  return dateTime.year >= 2024 && dateTime.year <= 2099 &&
+         dateTime.month >= 1 && dateTime.month <= 12 &&
+         dateTime.day >= 1 && dateTime.day <= daysInMonth(dateTime.year, dateTime.month) &&
+         dateTime.hour <= 23 &&
+         dateTime.minute <= 59 &&
+         dateTime.second <= 59 &&
+         dateTime.dayOfWeek >= 1 && dateTime.dayOfWeek <= 7;
+}
+
+byte decimalToBcd(byte value) {
+  return ((value / 10) << 4) | (value % 10);
+}
+
+byte bcdToDecimal(byte value) {
+  return ((value >> 4) * 10) + (value & 0x0F);
+}
+
+bool isI2CDeviceAvailable(byte address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+
+bool writeDs3231Register(byte reg, byte value) {
+  if (!ds3231Available) {
+    return false;
+  }
+
+  Wire.beginTransmission(DS3231_ADDRESS);
+  Wire.write(reg);
+  Wire.write(value);
+  return Wire.endTransmission() == 0;
+}
+
+bool readDs3231Registers(byte startReg, byte *buffer, byte length) {
+  if (!ds3231Available) {
+    return false;
+  }
+
+  Wire.beginTransmission(DS3231_ADDRESS);
+  Wire.write(startReg);
+
+  if (Wire.endTransmission(false) != 0) {
+    return false;
+  }
+
+  byte readCount = Wire.requestFrom(DS3231_ADDRESS, length);
+
+  if (readCount != length) {
+    return false;
+  }
+
+  for (byte i = 0; i < length; i++) {
+    buffer[i] = Wire.read();
+  }
+
+  return true;
+}
+
+bool writeDs3231DateTime(const RtcDateTime &dateTime) {
+  if (!isValidDateTime(dateTime)) {
+    return false;
+  }
+
+  Wire.beginTransmission(DS3231_ADDRESS);
+  Wire.write(0x00);
+  Wire.write(decimalToBcd(dateTime.second));
+  Wire.write(decimalToBcd(dateTime.minute));
+  Wire.write(decimalToBcd(dateTime.hour));
+  Wire.write(decimalToBcd(dateTime.dayOfWeek));
+  Wire.write(decimalToBcd(dateTime.day));
+  Wire.write(decimalToBcd(dateTime.month));
+  Wire.write(decimalToBcd(dateTime.year - 2000));
+
+  if (Wire.endTransmission() != 0) {
+    return false;
+  }
+
+  byte statusRegister = 0;
+
+  if (readDs3231Registers(0x0F, &statusRegister, 1)) {
+    writeDs3231Register(0x0F, statusRegister & ~0x80);
+  }
+
+  return true;
+}
+
+RtcDateTime readDs3231DateTime() {
+  RtcDateTime dateTime;
+  dateTime.valid = false;
+
+  byte statusRegister = 0;
+
+  if (!readDs3231Registers(0x0F, &statusRegister, 1) || (statusRegister & 0x80)) {
+    return dateTime;
+  }
+
+  byte buffer[7];
+
+  if (!readDs3231Registers(0x00, buffer, 7)) {
+    return dateTime;
+  }
+
+  dateTime.second = bcdToDecimal(buffer[0] & 0x7F);
+  dateTime.minute = bcdToDecimal(buffer[1] & 0x7F);
+  dateTime.hour = bcdToDecimal(buffer[2] & 0x3F);
+  dateTime.dayOfWeek = bcdToDecimal(buffer[3] & 0x07);
+  dateTime.day = bcdToDecimal(buffer[4] & 0x3F);
+  dateTime.month = bcdToDecimal(buffer[5] & 0x1F);
+  dateTime.year = 2000 + bcdToDecimal(buffer[6]);
+  dateTime.valid = isValidDateTime(dateTime);
+
+  return dateTime;
+}
+
 void incrementDate(RtcDateTime &dateTime) {
   dateTime.day++;
   dateTime.dayOfWeek++;
@@ -394,6 +540,23 @@ void setSoftwareClock(const RtcDateTime &dateTime) {
   softwareClockValid = true;
 }
 
+bool setCurrentDateTime(const RtcDateTime &dateTime) {
+  if (!isValidDateTime(dateTime)) {
+    return false;
+  }
+
+  bool rtcUpdated = writeDs3231DateTime(dateTime);
+  setSoftwareClock(dateTime);
+
+  if (rtcUpdated) {
+    Serial.println("RTC DS3231 updated from Android MQTT payload.");
+  } else {
+    Serial.println("RTC DS3231 update failed. Using software clock until RTC is available.");
+  }
+
+  return rtcUpdated;
+}
+
 RtcDateTime readSoftwareClock() {
   RtcDateTime now = softwareClockBase;
 
@@ -406,6 +569,13 @@ RtcDateTime readSoftwareClock() {
 }
 
 RtcDateTime readCurrentDateTime() {
+  RtcDateTime rtcNow = readDs3231DateTime();
+
+  if (rtcNow.valid) {
+    setSoftwareClock(rtcNow);
+    return rtcNow;
+  }
+
   return readSoftwareClock();
 }
 
@@ -451,6 +621,43 @@ int relayPin(byte relay) {
   }
 }
 
+void setRelayState(byte relay, bool isOn) {
+  int pin = relayPin(relay);
+
+  if (pin < 0) {
+    return;
+  }
+
+  digitalWrite(pin, isOn ? RELAY_ON : RELAY_OFF);
+}
+
+void setManualRelayOverride(byte relay, bool isOn) {
+  if (relay < 1 || relay > 4) {
+    return;
+  }
+
+  manualOverrideActive[relay - 1] = true;
+  manualOverrideState[relay - 1] = isOn;
+  setRelayState(relay, isOn);
+
+  Serial.print("Manual override Relay");
+  Serial.print(relay);
+  Serial.print(": ");
+  Serial.println(isOn ? "ON" : "OFF");
+}
+
+void clearManualOverride(byte relay) {
+  if (relay < 1 || relay > 4 || !manualOverrideActive[relay - 1]) {
+    return;
+  }
+
+  manualOverrideActive[relay - 1] = false;
+
+  Serial.print("Manual override Relay");
+  Serial.print(relay);
+  Serial.println(" released by schedule transition.");
+}
+
 void applyRelaySchedules(const RtcDateTime &now) {
   bool relayAutoActive[4] = { false, false, false, false };
   bool relayConfigured[4] = { false, false, false, false };
@@ -469,15 +676,32 @@ void applyRelaySchedules(const RtcDateTime &now) {
 
   for (byte i = 0; i < 4; i++) {
     if (relayConfigured[i]) {
-      digitalWrite(relayPin(i + 1), relayAutoActive[i] ? RELAY_ON : RELAY_OFF);
+      if (relayAutoActive[i] != lastScheduleAutoActive[i]) {
+        clearManualOverride(i + 1);
+      }
+
+      lastScheduleAutoActive[i] = relayAutoActive[i];
+
+      if (manualOverrideActive[i]) {
+        setRelayState(i + 1, manualOverrideState[i]);
+        continue;
+      }
+
+      setRelayState(i + 1, relayAutoActive[i]);
     }
   }
 }
 
 void maintainLcdDisplay() {
+  RtcDateTime now = readCurrentDateTime();
+
+  if (!now.valid) {
+    showSensorScreen = true;
+  }
+
   unsigned long duration = showSensorScreen ? LCD_SENSOR_SCREEN_DURATION : LCD_TIME_SCREEN_DURATION;
 
-  if (millis() - lcdScreenStartedAt >= duration) {
+  if (now.valid && millis() - lcdScreenStartedAt >= duration) {
     showSensorScreen = !showSensorScreen;
     lcdScreenStartedAt = millis();
   }
@@ -489,7 +713,7 @@ void maintainLcdDisplay() {
       displaySensorError();
     }
   } else {
-    displayTimeData(readCurrentDateTime());
+    displayTimeData(now);
   }
 }
 
@@ -625,10 +849,50 @@ void printThresholdCheck(float nitrogen, float phosphorus, float potassium, floa
 
 // ================= WIFI =================
 void setup_wifi() {
-  Serial.println("Starting WiFi connection attempt...");
+  Serial.println("Starting WiFiManager...");
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+
+  wifiManager.setConnectTimeout(WIFI_CONNECT_TIMEOUT_SECONDS);
+  wifiManager.setConfigPortalBlocking(false);
+
+  // Uncomment this line only when you want to erase saved WiFi credentials.
+  // wifiManager.resetSettings();
+
+  bool connected = wifiManager.autoConnect(WIFI_MANAGER_AP_NAME, WIFI_MANAGER_AP_PASSWORD);
+
   wifiStarted = true;
+  lastWifiAttemptTime = millis();
+
+  if (!connected) {
+    wifiManagerPortalRunning = true;
+    wifiConnectedLogged = false;
+    Serial.println("WiFi not connected yet.");
+    Serial.print("Config portal active. Connect your phone to AP: ");
+    Serial.println(WIFI_MANAGER_AP_NAME);
+    return;
+  }
+
+  wifiManagerPortalRunning = false;
+  wifiConnectedLogged = true;
+  Serial.println("WiFi connected.");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void tryReconnectSavedWiFi() {
+  Serial.println("Trying saved WiFi credentials in background...");
+
+  if (wifiManagerPortalRunning) {
+    WiFi.mode(WIFI_AP_STA);
+  } else {
+    WiFi.mode(WIFI_STA);
+  }
+
+  bool reconnectStarted = WiFi.reconnect();
+  if (!reconnectStarted) {
+    WiFi.begin();
+  }
+
   lastWifiAttemptTime = millis();
 }
 
@@ -660,12 +924,32 @@ void reconnect() {
 }
 
 void maintainNetwork() {
+  if (wifiStarted) {
+    wifiManager.process();
+  }
+
   if (WiFi.status() != WL_CONNECTED) {
-    if (!wifiStarted || millis() - lastWifiAttemptTime >= WIFI_RETRY_INTERVAL) {
+    wifiConnectedLogged = false;
+
+    if (!wifiStarted) {
       setup_wifi();
+      return;
+    }
+
+    if (millis() - lastWifiAttemptTime >= WIFI_RETRY_INTERVAL) {
+      tryReconnectSavedWiFi();
     }
 
     return;
+  }
+
+  wifiManagerPortalRunning = false;
+
+  if (!wifiConnectedLogged) {
+    wifiConnectedLogged = true;
+    Serial.println("WiFi connected.");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
   }
 
   if (!client.connected() && millis() - lastMqttAttemptTime >= MQTT_RETRY_INTERVAL) {
@@ -750,8 +1034,273 @@ byte parseDaysMask(JsonVariant days) {
   return mask;
 }
 
+void writeUint16(byte *buffer, uint16_t index, uint16_t value) {
+  buffer[index] = (value >> 8) & 0xFF;
+  buffer[index + 1] = value & 0xFF;
+}
+
+uint16_t readUint16(const byte *buffer, uint16_t index) {
+  return (uint16_t(buffer[index]) << 8) | buffer[index + 1];
+}
+
+byte calculateScheduleStorageChecksum(byte *buffer) {
+  byte checksum = 0;
+  byte originalChecksum = buffer[SCHEDULE_STORAGE_CHECKSUM_INDEX];
+  buffer[SCHEDULE_STORAGE_CHECKSUM_INDEX] = 0;
+
+  for (uint16_t i = 0; i < SCHEDULE_STORAGE_TOTAL_BYTES; i++) {
+    checksum += buffer[i];
+  }
+
+  buffer[SCHEDULE_STORAGE_CHECKSUM_INDEX] = originalChecksum;
+  return checksum;
+}
+
+bool readAt24C32Bytes(uint16_t address, byte *buffer, uint16_t length) {
+  if (!at24c32Available) {
+    return false;
+  }
+
+  uint16_t offset = 0;
+
+  while (offset < length) {
+    byte chunk = length - offset;
+
+    if (chunk > AT24C32_PAGE_SIZE) {
+      chunk = AT24C32_PAGE_SIZE;
+    }
+
+    Wire.beginTransmission(AT24C32_ADDRESS);
+    Wire.write((address + offset) >> 8);
+    Wire.write((address + offset) & 0xFF);
+
+    if (Wire.endTransmission(false) != 0) {
+      return false;
+    }
+
+    byte readCount = Wire.requestFrom(AT24C32_ADDRESS, chunk);
+
+    if (readCount != chunk) {
+      return false;
+    }
+
+    for (byte i = 0; i < chunk; i++) {
+      buffer[offset + i] = Wire.read();
+    }
+
+    offset += chunk;
+  }
+
+  return true;
+}
+
+bool writeAt24C32Bytes(uint16_t address, const byte *buffer, uint16_t length) {
+  if (!at24c32Available) {
+    return false;
+  }
+
+  uint16_t offset = 0;
+
+  while (offset < length) {
+    byte pageRemaining = AT24C32_PAGE_SIZE - ((address + offset) % AT24C32_PAGE_SIZE);
+    byte chunk = length - offset;
+
+    if (chunk > pageRemaining) {
+      chunk = pageRemaining;
+    }
+
+    Wire.beginTransmission(AT24C32_ADDRESS);
+    Wire.write((address + offset) >> 8);
+    Wire.write((address + offset) & 0xFF);
+
+    for (byte i = 0; i < chunk; i++) {
+      Wire.write(buffer[offset + i]);
+    }
+
+    if (Wire.endTransmission() != 0) {
+      return false;
+    }
+
+    delay(6);
+    offset += chunk;
+  }
+
+  return true;
+}
+
+bool isValidSchedule(const RelaySchedule &schedule) {
+  if (!schedule.enabled) {
+    return true;
+  }
+
+  return schedule.relay >= 1 && schedule.relay <= 4 &&
+         schedule.startYear >= 2024 && schedule.startYear <= 2099 &&
+         schedule.startMonth >= 1 && schedule.startMonth <= 12 &&
+         schedule.startDay >= 1 && schedule.startDay <= daysInMonth(schedule.startYear, schedule.startMonth) &&
+         schedule.endYear >= 2024 && schedule.endYear <= 2099 &&
+         schedule.endMonth >= 1 && schedule.endMonth <= 12 &&
+         schedule.endDay >= 1 && schedule.endDay <= daysInMonth(schedule.endYear, schedule.endMonth) &&
+         dateKey(schedule.startYear, schedule.startMonth, schedule.startDay) <=
+           dateKey(schedule.endYear, schedule.endMonth, schedule.endDay) &&
+         schedule.hour <= 23 &&
+         schedule.minute <= 59 &&
+         schedule.durationSeconds > 0 && schedule.durationSeconds <= 65535 &&
+         schedule.daysMask <= 0x7F;
+}
+
+void clearSchedules() {
+  for (byte i = 0; i < MAX_SCHEDULES; i++) {
+    relaySchedules[i].enabled = false;
+    relaySchedules[i].relay = i + 1;
+    relaySchedules[i].startYear = 2024;
+    relaySchedules[i].startMonth = 1;
+    relaySchedules[i].startDay = 1;
+    relaySchedules[i].endYear = 2099;
+    relaySchedules[i].endMonth = 12;
+    relaySchedules[i].endDay = 31;
+    relaySchedules[i].hour = 6;
+    relaySchedules[i].minute = 0;
+    relaySchedules[i].durationSeconds = 5;
+    relaySchedules[i].daysMask = 0;
+    relaySchedules[i].activeToday = false;
+  }
+}
+
+bool saveSchedulesToEeprom() {
+  byte buffer[SCHEDULE_STORAGE_TOTAL_BYTES];
+
+  for (uint16_t i = 0; i < SCHEDULE_STORAGE_TOTAL_BYTES; i++) {
+    buffer[i] = 0;
+  }
+
+  buffer[0] = SCHEDULE_STORAGE_MAGIC_0;
+  buffer[1] = SCHEDULE_STORAGE_MAGIC_1;
+  buffer[2] = SCHEDULE_STORAGE_MAGIC_2;
+  buffer[3] = SCHEDULE_STORAGE_MAGIC_3;
+  buffer[4] = SCHEDULE_STORAGE_VERSION;
+  buffer[5] = MAX_SCHEDULES;
+  buffer[6] = SCHEDULE_STORAGE_RECORD_BYTES;
+
+  for (byte i = 0; i < MAX_SCHEDULES; i++) {
+    const RelaySchedule &schedule = relaySchedules[i];
+    uint16_t index = SCHEDULE_STORAGE_HEADER_BYTES + (i * SCHEDULE_STORAGE_RECORD_BYTES);
+
+    buffer[index] = schedule.enabled ? 1 : 0;
+    buffer[index + 1] = schedule.relay;
+    writeUint16(buffer, index + 2, schedule.startYear);
+    buffer[index + 4] = schedule.startMonth;
+    buffer[index + 5] = schedule.startDay;
+    writeUint16(buffer, index + 6, schedule.endYear);
+    buffer[index + 8] = schedule.endMonth;
+    buffer[index + 9] = schedule.endDay;
+    buffer[index + 10] = schedule.hour;
+    buffer[index + 11] = schedule.minute;
+    writeUint16(buffer, index + 12, schedule.durationSeconds);
+    buffer[index + 14] = schedule.daysMask;
+  }
+
+  buffer[SCHEDULE_STORAGE_CHECKSUM_INDEX] = calculateScheduleStorageChecksum(buffer);
+
+  if (!writeAt24C32Bytes(SCHEDULE_STORAGE_ADDRESS, buffer, SCHEDULE_STORAGE_TOTAL_BYTES)) {
+    Serial.println("Failed saving schedules to AT24C32.");
+    return false;
+  }
+
+  Serial.println("Schedules saved to AT24C32 EEPROM.");
+  return true;
+}
+
+bool loadSchedulesFromEeprom() {
+  byte buffer[SCHEDULE_STORAGE_TOTAL_BYTES];
+
+  if (!readAt24C32Bytes(SCHEDULE_STORAGE_ADDRESS, buffer, SCHEDULE_STORAGE_TOTAL_BYTES)) {
+    Serial.println("Failed reading schedules from AT24C32.");
+    return false;
+  }
+
+  byte storedChecksum = buffer[SCHEDULE_STORAGE_CHECKSUM_INDEX];
+
+  if (buffer[0] != SCHEDULE_STORAGE_MAGIC_0 ||
+      buffer[1] != SCHEDULE_STORAGE_MAGIC_1 ||
+      buffer[2] != SCHEDULE_STORAGE_MAGIC_2 ||
+      buffer[3] != SCHEDULE_STORAGE_MAGIC_3 ||
+      buffer[4] != SCHEDULE_STORAGE_VERSION ||
+      buffer[5] != MAX_SCHEDULES ||
+      buffer[6] != SCHEDULE_STORAGE_RECORD_BYTES ||
+      storedChecksum != calculateScheduleStorageChecksum(buffer)) {
+    Serial.println("No valid saved schedule found in AT24C32.");
+    return false;
+  }
+
+  for (byte i = 0; i < MAX_SCHEDULES; i++) {
+    RelaySchedule schedule;
+    uint16_t index = SCHEDULE_STORAGE_HEADER_BYTES + (i * SCHEDULE_STORAGE_RECORD_BYTES);
+
+    schedule.enabled = buffer[index] == 1;
+    schedule.relay = buffer[index + 1];
+    schedule.startYear = readUint16(buffer, index + 2);
+    schedule.startMonth = buffer[index + 4];
+    schedule.startDay = buffer[index + 5];
+    schedule.endYear = readUint16(buffer, index + 6);
+    schedule.endMonth = buffer[index + 8];
+    schedule.endDay = buffer[index + 9];
+    schedule.hour = buffer[index + 10];
+    schedule.minute = buffer[index + 11];
+    schedule.durationSeconds = readUint16(buffer, index + 12);
+    schedule.daysMask = buffer[index + 14];
+    schedule.activeToday = false;
+
+    if (!isValidSchedule(schedule)) {
+      Serial.println("Saved schedule is invalid. Ignoring AT24C32 data.");
+      return false;
+    }
+
+    relaySchedules[i] = schedule;
+  }
+
+  Serial.println("Schedules loaded from AT24C32 EEPROM.");
+  return true;
+}
+
+void setupRtcAndScheduleStorage() {
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  ds3231Available = isI2CDeviceAvailable(DS3231_ADDRESS);
+  at24c32Available = isI2CDeviceAvailable(AT24C32_ADDRESS);
+
+  Serial.print("DS3231 RTC: ");
+  Serial.println(ds3231Available ? "detected" : "not detected");
+
+  Serial.print("AT24C32 EEPROM: ");
+  Serial.println(at24c32Available ? "detected" : "not detected");
+
+  clearSchedules();
+
+  if (at24c32Available) {
+    loadSchedulesFromEeprom();
+  }
+
+  RtcDateTime rtcNow = readDs3231DateTime();
+
+  if (rtcNow.valid) {
+    setSoftwareClock(rtcNow);
+    Serial.println("System time loaded from DS3231 RTC.");
+  } else if (ds3231Available) {
+    Serial.println("DS3231 time is not valid yet. Set time from Android.");
+  }
+}
+
 void updateRtcFromJson(JsonObject rtcConfig) {
   if (rtcConfig.isNull()) {
+    return;
+  }
+
+  bool forceUpdate = (rtcConfig["force_update"] | false) || (rtcConfig["force"] | false);
+  RtcDateTime currentRtc = readDs3231DateTime();
+
+  if (currentRtc.valid && !forceUpdate) {
+    setSoftwareClock(currentRtc);
+    Serial.println("RTC MQTT payload ignored. Time remains locked to DS3231.");
     return;
   }
 
@@ -768,31 +1317,21 @@ void updateRtcFromJson(JsonObject rtcConfig) {
     dateTime.dayOfWeek = calculateDayOfWeek(dateTime.year, dateTime.month, dateTime.day);
   }
 
-  dateTime.valid =
-    dateTime.year >= 2024 &&
-    dateTime.month >= 1 && dateTime.month <= 12 &&
-    dateTime.day >= 1 && dateTime.day <= 31 &&
-    dateTime.hour <= 23 &&
-    dateTime.minute <= 59 &&
-    dateTime.second <= 59;
+  dateTime.valid = isValidDateTime(dateTime);
 
   if (dateTime.valid) {
-    setSoftwareClock(dateTime);
-    Serial.println("System time updated from Android MQTT payload.");
+    setCurrentDateTime(dateTime);
   } else {
     Serial.println("Invalid time payload. System time not updated.");
   }
 }
 
 void updateSchedulesFromJson(JsonArray schedules) {
-  for (byte i = 0; i < MAX_SCHEDULES; i++) {
-    relaySchedules[i].enabled = false;
-  }
-
   if (schedules.isNull()) {
     return;
   }
 
+  clearSchedules();
   byte index = 0;
 
   for (JsonObject item : schedules) {
@@ -814,7 +1353,7 @@ void updateSchedulesFromJson(JsonArray schedules) {
     bool validEndDate = parseDateString(endDateText, schedule.endYear, schedule.endMonth, schedule.endDay);
     bool validTime = parseTimeString(timeText, schedule.hour, schedule.minute);
 
-    if (!validStartDate || !validEndDate || !validTime || schedule.relay < 1 || schedule.relay > 4) {
+    if (!validStartDate || !validEndDate || !validTime || !isValidSchedule(schedule)) {
       schedule.enabled = false;
     }
 
@@ -822,6 +1361,7 @@ void updateSchedulesFromJson(JsonArray schedules) {
   }
 
   Serial.println("Relay schedules updated from Android.");
+  saveSchedulesToEeprom();
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
@@ -859,36 +1399,32 @@ void callback(char* topic, byte* payload, unsigned int length) {
   if (topicStr == "nutrixense/control") {
     Serial.println("=== RELAY CONTROL ===");
 
-    if (doc.containsKey("relay1")) {
-      int state = doc["relay1"].as<int>();
-      digitalWrite(RELAY1, state ? RELAY_ON : RELAY_OFF);
+    const char* commandSource = doc["source"] | "";
+    bool isManualCommand =
+      strcmp(commandSource, "manual") == 0 || doc.containsKey("manual_override");
 
-      Serial.print("Relay1: ");
-      Serial.println(state ? "ON" : "OFF");
-    }
+    for (byte relay = 1; relay <= 4; relay++) {
+      char relayKey[8];
+      snprintf(relayKey, sizeof(relayKey), "relay%d", relay);
 
-    if (doc.containsKey("relay2")) {
-      int state = doc["relay2"].as<int>();
-      digitalWrite(RELAY2, state ? RELAY_ON : RELAY_OFF);
+      if (!doc.containsKey(relayKey)) {
+        continue;
+      }
 
-      Serial.print("Relay2: ");
-      Serial.println(state ? "ON" : "OFF");
-    }
+      int state = doc[relayKey].as<int>();
+      bool isOn = state == 1;
 
-    if (doc.containsKey("relay3")) {
-      int state = doc["relay3"].as<int>();
-      digitalWrite(RELAY3, state ? RELAY_ON : RELAY_OFF);
+      if (isManualCommand) {
+        setManualRelayOverride(relay, isOn);
+      } else {
+        manualOverrideActive[relay - 1] = false;
+        setRelayState(relay, isOn);
 
-      Serial.print("Relay3: ");
-      Serial.println(state ? "ON" : "OFF");
-    }
-
-    if (doc.containsKey("relay4")) {
-      int state = doc["relay4"].as<int>();
-      digitalWrite(RELAY4, state ? RELAY_ON : RELAY_OFF);
-
-      Serial.print("Relay4: ");
-      Serial.println(state ? "ON" : "OFF");
+        Serial.print("Relay");
+        Serial.print(relay);
+        Serial.print(": ");
+        Serial.println(isOn ? "ON" : "OFF");
+      }
     }
   }
 
@@ -896,17 +1432,22 @@ void callback(char* topic, byte* payload, unsigned int length) {
   // MQTT TOPIC : nutrixense/schedule
   // Payload example:
   // {
-  //   "rtc": {"year":2026,"month":7,"day":2,"hour":6,"minute":30,"second":0},
+  //   "rtc": {"year":2026,"month":7,"day":2,"hour":6,"minute":30,"second":0,"day_of_week":5},
   //   "schedules": [
   //     {"enabled":true,"relay":1,"start_date":"2026-07-02","end_date":"2026-12-31","time":"06:30","duration_seconds":5,"days":[2,3,4,5,6]}
   //   ]
   // }
+  // RTC is written only when DS3231 time is invalid, or rtc.force_update=true.
+  // Schedules are saved to AT24C32.
   // =====================================================
   else if (topicStr == "nutrixense/schedule") {
     Serial.println("=== SCHEDULE CONFIG ===");
 
     updateRtcFromJson(doc["rtc"].as<JsonObject>());
-    updateSchedulesFromJson(doc["schedules"].as<JsonArray>());
+
+    if (doc.containsKey("schedules")) {
+      updateSchedulesFromJson(doc["schedules"].as<JsonArray>());
+    }
   }
 
   // =====================================================
@@ -1011,6 +1552,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
 
 void setup() {
   Serial.begin(115200);
+  setupRtcAndScheduleStorage();
 
   // ================= RELAY SETUP =================
   pinMode(RELAY1, OUTPUT);
@@ -1057,6 +1599,7 @@ void setup() {
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(callback);
   client.setBufferSize(2048);
+  client.setSocketTimeout(2);
 
   Serial.println("System Ready...");
 }
@@ -1209,6 +1752,21 @@ void loop() {
     payload += ",\"relay3\":" + String(digitalRead(RELAY3) == RELAY_ON ? 1 : 0);
     payload += ",\"relay4\":" + String(digitalRead(RELAY4) == RELAY_ON ? 1 : 0);
     payload += ",\"buzzer\":" + String(digitalRead(BUZZER_PIN) == BUZZER_ON ? 1 : 0);
+    payload += ",\"rtc_valid\":" + String(now.valid ? 1 : 0);
+    payload += ",\"rtc_available\":" + String(ds3231Available ? 1 : 0);
+    payload += ",\"schedule_storage\":" + String(at24c32Available ? 1 : 0);
+
+    if (now.valid) {
+      payload += ",\"rtc\":{";
+      payload += "\"year\":" + String(now.year) + ",";
+      payload += "\"month\":" + String(now.month) + ",";
+      payload += "\"day\":" + String(now.day) + ",";
+      payload += "\"hour\":" + String(now.hour) + ",";
+      payload += "\"minute\":" + String(now.minute) + ",";
+      payload += "\"second\":" + String(now.second) + ",";
+      payload += "\"day_of_week\":" + String(now.dayOfWeek);
+      payload += "}";
+    }
 
     payload += "}";
 
