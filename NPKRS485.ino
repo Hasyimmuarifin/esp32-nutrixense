@@ -6,22 +6,50 @@
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <LittleFS.h>
+
+#define DEBUG_MODE 0
+#if DEBUG_MODE
+  #define DEBUG_PRINT(x) Serial.print(x)
+  #define DEBUG_PRINTLN(x) Serial.println(x)
+  #define DEBUG_PRINTLN_EMPTY() Serial.println()
+#else
+  #define DEBUG_PRINT(x)
+  #define DEBUG_PRINTLN(x)
+  #define DEBUG_PRINTLN_EMPTY()
+#endif
 
 // ================= WIFI =================
 const char* WIFI_MANAGER_AP_NAME = "NutriXense";
 const char* WIFI_MANAGER_AP_PASSWORD = "12345678";
 WiFiManager wifiManager;
+const unsigned long WIFI_PORTAL_REOPEN_DELAY = 10000;
+unsigned long wifiDisconnectedSince = 0;
 
 // ================= HIVEMQ =================
 const char* mqtt_server = "a8805b4f45744c3f9ac83882e423e0c0.s1.eu.hivemq.cloud";
 const int mqtt_port = 8883;
 const char* mqtt_user = "hasyim";
 const char* mqtt_pass = "hasyimHiveMQTT@22";
-const char* topic = "nutrixense/sensor";
+const char* realtimeTopic = "nutrixense/sensor";
+
+// ================= LITTLEFS OFFLINE LOGGER =================
+const char* historyTopic = "nutrixense/history";
+const char* OFFLINE_LOG_FILE = "/offline_history.jsonl";
+const char* OFFLINE_TEMP_FILE = "/offline_history_tmp.jsonl";
+
+const int MAX_SYNC_PER_LOOP = 20;
+const unsigned long OFFLINE_SYNC_INTERVAL = 5000;
+unsigned long lastOfflineSyncTime = 0;
+
+unsigned long offlineSavedCount = 0;
+unsigned long offlineSyncedCount = 0;
 
 // ================= MQTT =================
 WiFiClientSecure espClient;
 PubSubClient client(espClient);
+const byte MQTT_FAILURES_BEFORE_PORTAL = 5;
+byte mqttFailedAttempts = 0;
 
 // Inisialisasi Modbus
 ModbusMaster node;
@@ -42,6 +70,7 @@ LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLUMNS, LCD_ROWS);
 
 bool ds3231Available = false;
 bool at24c32Available = false;
+bool littleFsReady = false;
 
 // Control Pin MAX485
 #define MAX485_DE_RE 4
@@ -51,14 +80,14 @@ bool at24c32Available = false;
 #define TXD2 17
 
 // ================= RELAY =================
-// Relay module uses active LOW: LOW = ON, HIGH = OFF
+// Relay module uses active HIGH: LOW = OFF, HIGH = ON
 #define RELAY1 25
 #define RELAY2 26
 #define RELAY3 27
 #define RELAY4 14
-
 #define RELAY_OFF LOW
 #define RELAY_ON HIGH
+const byte RELAY_PINS[4] = { RELAY1, RELAY2, RELAY3, RELAY4 };
 
 // ================= BUZZER =================
 #define BUZZER_PIN 18
@@ -71,8 +100,8 @@ bool at24c32Available = false;
 // ================= TIMING =================
 unsigned long lastReadTime = 0;
 const unsigned long READ_INTERVAL = 2000;
-const unsigned long SENSOR_DELAY = 100;
-bool sensorReadSuccess = true;
+const unsigned long HISTORY_LOG_INTERVAL = 60000;
+unsigned long lastHistoryLogTime = 0;
 
 const unsigned long WIFI_RETRY_INTERVAL = 15000;
 const unsigned long WIFI_CONNECT_TIMEOUT_SECONDS = 5;
@@ -139,7 +168,6 @@ struct RelaySchedule {
   byte minute;
   unsigned int durationSeconds;
   byte daysMask;
-  bool activeToday;
 };
 
 const byte MAX_SCHEDULES = 4;
@@ -549,9 +577,9 @@ bool setCurrentDateTime(const RtcDateTime &dateTime) {
   setSoftwareClock(dateTime);
 
   if (rtcUpdated) {
-    Serial.println("RTC DS3231 updated from Android MQTT payload.");
+    DEBUG_PRINTLN("RTC DS3231 updated from Android MQTT payload.");
   } else {
-    Serial.println("RTC DS3231 update failed. Using software clock until RTC is available.");
+    DEBUG_PRINTLN("RTC DS3231 update failed. Using software clock until RTC is available.");
   }
 
   return rtcUpdated;
@@ -612,12 +640,17 @@ bool isScheduleActiveNow(const RelaySchedule &schedule, const RtcDateTime &now) 
 }
 
 int relayPin(byte relay) {
-  switch (relay) {
-    case 1: return RELAY1;
-    case 2: return RELAY2;
-    case 3: return RELAY3;
-    case 4: return RELAY4;
-    default: return -1;
+  if (relay < 1 || relay > 4) {
+    return -1;
+  }
+
+  return RELAY_PINS[relay - 1];
+}
+
+void setupRelays() {
+  for (byte i = 0; i < 4; i++) {
+    pinMode(RELAY_PINS[i], OUTPUT);
+    digitalWrite(RELAY_PINS[i], RELAY_OFF);
   }
 }
 
@@ -640,10 +673,10 @@ void setManualRelayOverride(byte relay, bool isOn) {
   manualOverrideState[relay - 1] = isOn;
   setRelayState(relay, isOn);
 
-  Serial.print("Manual override Relay");
-  Serial.print(relay);
-  Serial.print(": ");
-  Serial.println(isOn ? "ON" : "OFF");
+  DEBUG_PRINT("Manual override Relay");
+  DEBUG_PRINT(relay);
+  DEBUG_PRINT(": ");
+  DEBUG_PRINTLN(isOn ? "ON" : "OFF");
 }
 
 void clearManualOverride(byte relay) {
@@ -653,9 +686,9 @@ void clearManualOverride(byte relay) {
 
   manualOverrideActive[relay - 1] = false;
 
-  Serial.print("Manual override Relay");
-  Serial.print(relay);
-  Serial.println(" released by schedule transition.");
+  DEBUG_PRINT("Manual override Relay");
+  DEBUG_PRINT(relay);
+  DEBUG_PRINTLN(" released by schedule transition.");
 }
 
 void applyRelaySchedules(const RtcDateTime &now) {
@@ -748,108 +781,52 @@ void maintainBuzzer(bool nutrientAbnormal) {
   }
 }
 
+void printRange(const char* label, float minValue, float maxValue) {
+  DEBUG_PRINT(label);
+  DEBUG_PRINT(" : ");
+  DEBUG_PRINT(minValue);
+  DEBUG_PRINT(" - ");
+  DEBUG_PRINTLN(maxValue);
+}
+
 void printThresholds() {
-  Serial.println("===== CURRENT THRESHOLDS =====");
+  DEBUG_PRINTLN("===== CURRENT THRESHOLDS =====");
 
-  Serial.print("Nitrogen     : ");
-  Serial.print(MIN_NITROGEN);
-  Serial.print(" - ");
-  Serial.println(MAX_NITROGEN);
+  printRange("Nitrogen    ", MIN_NITROGEN, MAX_NITROGEN);
+  printRange("Phosphorus  ", MIN_PHOSPHORUS, MAX_PHOSPHORUS);
+  printRange("Potassium   ", MIN_POTASSIUM, MAX_POTASSIUM);
+  printRange("pH          ", MIN_PH, MAX_PH);
+  printRange("Moisture    ", MIN_MOISTURE, MAX_MOISTURE);
+  printRange("Temperature ", MIN_TEMPERATURE, MAX_TEMPERATURE);
+  printRange("EC          ", MIN_EC, MAX_EC);
+}
 
-  Serial.print("Phosphorus   : ");
-  Serial.print(MIN_PHOSPHORUS);
-  Serial.print(" - ");
-  Serial.println(MAX_PHOSPHORUS);
-
-  Serial.print("Potassium    : ");
-  Serial.print(MIN_POTASSIUM);
-  Serial.print(" - ");
-  Serial.println(MAX_POTASSIUM);
-
-  Serial.print("pH           : ");
-  Serial.print(MIN_PH);
-  Serial.print(" - ");
-  Serial.println(MAX_PH);
-
-  Serial.print("Moisture     : ");
-  Serial.print(MIN_MOISTURE);
-  Serial.print(" - ");
-  Serial.println(MAX_MOISTURE);
-
-  Serial.print("Temperature  : ");
-  Serial.print(MIN_TEMPERATURE);
-  Serial.print(" - ");
-  Serial.println(MAX_TEMPERATURE);
-
-  Serial.print("EC           : ");
-  Serial.print(MIN_EC);
-  Serial.print(" - ");
-  Serial.println(MAX_EC);
+void printValueRange(const char* label, float value, float minValue, float maxValue) {
+  DEBUG_PRINT(label);
+  DEBUG_PRINT(" : ");
+  DEBUG_PRINT(value);
+  DEBUG_PRINT(" (");
+  DEBUG_PRINT(minValue);
+  DEBUG_PRINT(" - ");
+  DEBUG_PRINT(maxValue);
+  DEBUG_PRINTLN(")");
 }
 
 void printThresholdCheck(float nitrogen, float phosphorus, float potassium, float ph, float moisture, float temperature, float ec) {
-  Serial.println("===== DEBUG THRESHOLD CHECK =====");
+  DEBUG_PRINTLN("===== DEBUG THRESHOLD CHECK =====");
 
-  Serial.print("Nitrogen     : ");
-  Serial.print(nitrogen);
-  Serial.print(" (");
-  Serial.print(MIN_NITROGEN);
-  Serial.print(" - ");
-  Serial.print(MAX_NITROGEN);
-  Serial.println(")");
-
-  Serial.print("Phosphorus   : ");
-  Serial.print(phosphorus);
-  Serial.print(" (");
-  Serial.print(MIN_PHOSPHORUS);
-  Serial.print(" - ");
-  Serial.print(MAX_PHOSPHORUS);
-  Serial.println(")");
-
-  Serial.print("Potassium    : ");
-  Serial.print(potassium);
-  Serial.print(" (");
-  Serial.print(MIN_POTASSIUM);
-  Serial.print(" - ");
-  Serial.print(MAX_POTASSIUM);
-  Serial.println(")");
-
-  Serial.print("pH           : ");
-  Serial.print(ph);
-  Serial.print(" (");
-  Serial.print(MIN_PH);
-  Serial.print(" - ");
-  Serial.print(MAX_PH);
-  Serial.println(")");
-
-  Serial.print("Moisture     : ");
-  Serial.print(moisture);
-  Serial.print(" (");
-  Serial.print(MIN_MOISTURE);
-  Serial.print(" - ");
-  Serial.print(MAX_MOISTURE);
-  Serial.println(")");
-
-  Serial.print("Temperature  : ");
-  Serial.print(temperature);
-  Serial.print(" (");
-  Serial.print(MIN_TEMPERATURE);
-  Serial.print(" - ");
-  Serial.print(MAX_TEMPERATURE);
-  Serial.println(")");
-
-  Serial.print("EC           : ");
-  Serial.print(ec);
-  Serial.print(" (");
-  Serial.print(MIN_EC);
-  Serial.print(" - ");
-  Serial.print(MAX_EC);
-  Serial.println(")");
+  printValueRange("Nitrogen    ", nitrogen, MIN_NITROGEN, MAX_NITROGEN);
+  printValueRange("Phosphorus  ", phosphorus, MIN_PHOSPHORUS, MAX_PHOSPHORUS);
+  printValueRange("Potassium   ", potassium, MIN_POTASSIUM, MAX_POTASSIUM);
+  printValueRange("pH          ", ph, MIN_PH, MAX_PH);
+  printValueRange("Moisture    ", moisture, MIN_MOISTURE, MAX_MOISTURE);
+  printValueRange("Temperature ", temperature, MIN_TEMPERATURE, MAX_TEMPERATURE);
+  printValueRange("EC          ", ec, MIN_EC, MAX_EC);
 }
 
 // ================= WIFI =================
 void setup_wifi() {
-  Serial.println("Starting WiFiManager...");
+  DEBUG_PRINTLN("Starting WiFiManager...");
   WiFi.mode(WIFI_STA);
 
   wifiManager.setConnectTimeout(WIFI_CONNECT_TIMEOUT_SECONDS);
@@ -866,21 +843,39 @@ void setup_wifi() {
   if (!connected) {
     wifiManagerPortalRunning = true;
     wifiConnectedLogged = false;
-    Serial.println("WiFi not connected yet.");
-    Serial.print("Config portal active. Connect your phone to AP: ");
-    Serial.println(WIFI_MANAGER_AP_NAME);
+    DEBUG_PRINTLN("WiFi not connected yet.");
+    DEBUG_PRINT("Config portal active. Connect your phone to AP: ");
+    DEBUG_PRINTLN(WIFI_MANAGER_AP_NAME);
     return;
   }
 
   wifiManagerPortalRunning = false;
   wifiConnectedLogged = true;
-  Serial.println("WiFi connected.");
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
+  DEBUG_PRINTLN("WiFi connected.");
+  DEBUG_PRINT("IP address: ");
+  DEBUG_PRINTLN(WiFi.localIP());
+}
+
+void startWifiConfigPortal() {
+  if (wifiManagerPortalRunning) {
+    return;
+  }
+
+  DEBUG_PRINTLN("Starting NutriXense config portal again...");
+  WiFi.mode(WIFI_AP_STA);
+
+  wifiManager.setConfigPortalBlocking(false);
+  wifiManager.startConfigPortal(
+    WIFI_MANAGER_AP_NAME,
+    WIFI_MANAGER_AP_PASSWORD
+  );
+
+  wifiManagerPortalRunning = true;
+  lastWifiAttemptTime = millis();
 }
 
 void tryReconnectSavedWiFi() {
-  Serial.println("Trying saved WiFi credentials in background...");
+  DEBUG_PRINTLN("Trying saved WiFi credentials in background...");
 
   if (wifiManagerPortalRunning) {
     WiFi.mode(WIFI_AP_STA);
@@ -903,23 +898,33 @@ void reconnect() {
   }
 
   lastMqttAttemptTime = millis();
-  Serial.print("Connecting MQTT...");
+  DEBUG_PRINT("Connecting MQTT...");
 
   if (client.connect("ESP32_Client", mqtt_user, mqtt_pass)) {
-    Serial.println("Connected!");
+    mqttFailedAttempts = 0;
+    DEBUG_PRINTLN("Connected!");
 
     client.subscribe("nutrixense/control");
-    Serial.println("Subscribed: nutrixense/control");
+    DEBUG_PRINTLN("Subscribed: nutrixense/control");
 
     client.subscribe("nutrixense/config");
-    Serial.println("Subscribed: nutrixense/config");
+    DEBUG_PRINTLN("Subscribed: nutrixense/config");
 
     client.subscribe("nutrixense/schedule");
-    Serial.println("Subscribed: nutrixense/schedule");
+    DEBUG_PRINTLN("Subscribed: nutrixense/schedule");
   } else {
-    Serial.print("Failed, rc=");
-    Serial.print(client.state());
-    Serial.println(" will retry later.");
+    mqttFailedAttempts++;
+
+    DEBUG_PRINT("Failed, rc=");
+    DEBUG_PRINT(client.state());
+    DEBUG_PRINT(" MQTT failed attempts=");
+    DEBUG_PRINTLN(mqttFailedAttempts);
+
+    if (mqttFailedAttempts >= MQTT_FAILURES_BEFORE_PORTAL) {
+      startWifiConfigPortal();
+    }
+
+    DEBUG_PRINTLN(" will retry later.");
   }
 }
 
@@ -931,6 +936,10 @@ void maintainNetwork() {
   if (WiFi.status() != WL_CONNECTED) {
     wifiConnectedLogged = false;
 
+    if (wifiDisconnectedSince == 0) {
+      wifiDisconnectedSince = millis();
+    }
+
     if (!wifiStarted) {
       setup_wifi();
       return;
@@ -940,16 +949,20 @@ void maintainNetwork() {
       tryReconnectSavedWiFi();
     }
 
+    if (millis() - wifiDisconnectedSince >= WIFI_PORTAL_REOPEN_DELAY) {
+      startWifiConfigPortal();
+    }
+
     return;
   }
 
-  wifiManagerPortalRunning = false;
+  wifiDisconnectedSince = 0;
 
   if (!wifiConnectedLogged) {
     wifiConnectedLogged = true;
-    Serial.println("WiFi connected.");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
+    DEBUG_PRINTLN("WiFi connected.");
+    DEBUG_PRINT("IP address: ");
+    DEBUG_PRINTLN(WiFi.localIP());
   }
 
   if (!client.connected() && millis() - lastMqttAttemptTime >= MQTT_RETRY_INTERVAL) {
@@ -959,23 +972,6 @@ void maintainNetwork() {
   if (client.connected()) {
     client.loop();
   }
-}
-
-// ================= READ REGISTER =================
-uint16_t readRegister(uint16_t reg, bool &success) {
-  uint8_t result = node.readHoldingRegisters(reg, 1);
-
-  if (result == node.ku8MBSuccess) {
-    success = true;
-    return node.getResponseBuffer(0);
-  }
-
-  success = false;
-
-  Serial.print("Failed reading register: 0x");
-  Serial.println(reg, HEX);
-
-  return 0;
 }
 
 byte calculateDayOfWeek(int year, byte month, byte day) {
@@ -989,6 +985,118 @@ byte calculateDayOfWeek(int year, byte month, byte day) {
   int h = (day + ((13 * (month + 1)) / 5) + k + (k / 4) + (j / 4) + (5 * j)) % 7;
 
   return ((h + 6) % 7) + 1;
+}
+
+bool readSensorData(float &moisture, float &temperature, float &ec, float &ph, float &nitrogen, float &phosphorus, float &potassium) {
+  uint8_t result = node.readHoldingRegisters(0x00, 7);
+
+  if (result != node.ku8MBSuccess) {
+    DEBUG_PRINTLN("FAILED reading sensor registers!");
+    return false;
+  }
+
+  moisture = node.getResponseBuffer(0) / 10.0;
+
+  int16_t tempRaw = (int16_t)node.getResponseBuffer(1);
+  temperature = tempRaw / 10.0;
+
+  ec = node.getResponseBuffer(2) / 1000.0;
+  ph = node.getResponseBuffer(3) / 10.0;
+  nitrogen = node.getResponseBuffer(4);
+  phosphorus = node.getResponseBuffer(5);
+  potassium = node.getResponseBuffer(6);
+
+  return true;
+}
+
+String buildSensorPayload(float moisture, float temperature, float ec, float ph, float nitrogen, float phosphorus, float potassium, const RtcDateTime &now, const char* source) {
+  StaticJsonDocument<1024> doc;
+
+  doc["moisture"] = moisture;
+  doc["temperature"] = temperature;
+  doc["ec"] = ec;
+  doc["ph"] = ph;
+  doc["nitrogen"] = nitrogen;
+  doc["phosphorus"] = phosphorus;
+  doc["potassium"] = potassium;
+
+  doc["relay1"] = digitalRead(RELAY1) == RELAY_ON ? 1 : 0;
+  doc["relay2"] = digitalRead(RELAY2) == RELAY_ON ? 1 : 0;
+  doc["relay3"] = digitalRead(RELAY3) == RELAY_ON ? 1 : 0;
+  doc["relay4"] = digitalRead(RELAY4) == RELAY_ON ? 1 : 0;
+
+  doc["buzzer"] = digitalRead(BUZZER_PIN) == BUZZER_ON ? 1 : 0;
+  doc["rtc_valid"] = now.valid ? 1 : 0;
+  doc["rtc_available"] = ds3231Available ? 1 : 0;
+  doc["schedule_storage"] = at24c32Available ? 1 : 0;
+  doc["source"] = source;
+
+  if (now.valid) {
+    JsonObject rtc = doc.createNestedObject("rtc");
+    rtc["year"] = now.year;
+    rtc["month"] = now.month;
+    rtc["day"] = now.day;
+    rtc["hour"] = now.hour;
+    rtc["minute"] = now.minute;
+    rtc["second"] = now.second;
+    rtc["day_of_week"] = now.dayOfWeek;
+
+    doc["timestamp"] = formatTimestamp(now);
+  }
+
+  String output;
+  serializeJson(doc, output);
+  return output;
+}
+
+String buildRelayStatusPayload(const RtcDateTime &now, const char* source) {
+  StaticJsonDocument<512> doc;
+
+  doc["relay1"] = digitalRead(RELAY1) == RELAY_ON ? 1 : 0;
+  doc["relay2"] = digitalRead(RELAY2) == RELAY_ON ? 1 : 0;
+  doc["relay3"] = digitalRead(RELAY3) == RELAY_ON ? 1 : 0;
+  doc["relay4"] = digitalRead(RELAY4) == RELAY_ON ? 1 : 0;
+
+  doc["buzzer"] = digitalRead(BUZZER_PIN) == BUZZER_ON ? 1 : 0;
+  doc["rtc_valid"] = now.valid ? 1 : 0;
+  doc["source"] = source;
+  doc["event"] = "relay_status";
+
+  if (now.valid) {
+    doc["timestamp"] = formatTimestamp(now);
+  }
+
+  String output;
+  serializeJson(doc, output);
+  return output;
+}
+
+void publishRelayStatusNow(const char* source) {
+  if (!client.connected()) {
+    return;
+  }
+
+  RtcDateTime now = readCurrentDateTime();
+
+  String payload = hasValidSensorData
+      ? buildSensorPayload(
+          lastMoisture,
+          lastTemperature,
+          lastEc,
+          lastPh,
+          lastNitrogen,
+          lastPhosphorus,
+          lastPotassium,
+          now,
+          source
+        )
+      : buildRelayStatusPayload(now, source);
+
+  if (client.publish(realtimeTopic, payload.c_str())) {
+    DEBUG_PRINTLN("Relay status MQTT Publish Success");
+  } else {
+    DEBUG_PRINTLN("Relay status MQTT Publish Failed");
+  }
 }
 
 bool parseDateString(const char* dateText, int &year, byte &month, byte &day) {
@@ -1162,7 +1270,6 @@ void clearSchedules() {
     relaySchedules[i].minute = 0;
     relaySchedules[i].durationSeconds = 5;
     relaySchedules[i].daysMask = 0;
-    relaySchedules[i].activeToday = false;
   }
 }
 
@@ -1202,11 +1309,11 @@ bool saveSchedulesToEeprom() {
   buffer[SCHEDULE_STORAGE_CHECKSUM_INDEX] = calculateScheduleStorageChecksum(buffer);
 
   if (!writeAt24C32Bytes(SCHEDULE_STORAGE_ADDRESS, buffer, SCHEDULE_STORAGE_TOTAL_BYTES)) {
-    Serial.println("Failed saving schedules to AT24C32.");
+    DEBUG_PRINTLN("Failed saving schedules to AT24C32.");
     return false;
   }
 
-  Serial.println("Schedules saved to AT24C32 EEPROM.");
+  DEBUG_PRINTLN("Schedules saved to AT24C32 EEPROM.");
   return true;
 }
 
@@ -1214,7 +1321,7 @@ bool loadSchedulesFromEeprom() {
   byte buffer[SCHEDULE_STORAGE_TOTAL_BYTES];
 
   if (!readAt24C32Bytes(SCHEDULE_STORAGE_ADDRESS, buffer, SCHEDULE_STORAGE_TOTAL_BYTES)) {
-    Serial.println("Failed reading schedules from AT24C32.");
+    DEBUG_PRINTLN("Failed reading schedules from AT24C32.");
     return false;
   }
 
@@ -1228,7 +1335,7 @@ bool loadSchedulesFromEeprom() {
       buffer[5] != MAX_SCHEDULES ||
       buffer[6] != SCHEDULE_STORAGE_RECORD_BYTES ||
       storedChecksum != calculateScheduleStorageChecksum(buffer)) {
-    Serial.println("No valid saved schedule found in AT24C32.");
+    DEBUG_PRINTLN("No valid saved schedule found in AT24C32.");
     return false;
   }
 
@@ -1248,18 +1355,78 @@ bool loadSchedulesFromEeprom() {
     schedule.minute = buffer[index + 11];
     schedule.durationSeconds = readUint16(buffer, index + 12);
     schedule.daysMask = buffer[index + 14];
-    schedule.activeToday = false;
 
     if (!isValidSchedule(schedule)) {
-      Serial.println("Saved schedule is invalid. Ignoring AT24C32 data.");
+      DEBUG_PRINTLN("Saved schedule is invalid. Ignoring AT24C32 data.");
       return false;
     }
 
     relaySchedules[i] = schedule;
   }
 
-  Serial.println("Schedules loaded from AT24C32 EEPROM.");
+  DEBUG_PRINTLN("Schedules loaded from AT24C32 EEPROM.");
   return true;
+}
+
+bool savePayloadToLittleFS(const String &payload) {
+  if (!littleFsReady) {
+    DEBUG_PRINTLN("LittleFS not ready. Cannot save offline payload.");
+    return false;
+  }
+  File file = LittleFS.open(OFFLINE_LOG_FILE, FILE_APPEND);
+
+  if (!file) {
+    DEBUG_PRINTLN("Failed to open offline log file for append.");
+    return false;
+  }
+
+  file.println(payload);
+  file.close();
+
+  offlineSavedCount++;
+
+  DEBUG_PRINT("Offline payload saved to LittleFS. Total saved: ");
+  DEBUG_PRINTLN(offlineSavedCount);
+
+  File checkFile = LittleFS.open(OFFLINE_LOG_FILE, FILE_READ);
+  if (checkFile) {
+    DEBUG_PRINT("Offline log file size: ");
+    DEBUG_PRINT(checkFile.size());
+    DEBUG_PRINTLN(" bytes");
+    checkFile.close();
+  }
+
+  return true;
+}
+
+String formatTimestamp(const RtcDateTime &now) {
+  if (!now.valid) {
+    return "";
+  }
+
+  String timestamp = "";
+  timestamp += String(now.year);
+  timestamp += "-";
+  timestamp += twoDigits(now.month);
+  timestamp += "-";
+  timestamp += twoDigits(now.day);
+  timestamp += " ";
+  timestamp += twoDigits(now.hour);
+  timestamp += ":";
+  timestamp += twoDigits(now.minute);
+  timestamp += ":";
+  timestamp += twoDigits(now.second);
+
+  return timestamp;
+}
+
+bool shouldLogHistory() {
+  if (millis() - lastHistoryLogTime >= HISTORY_LOG_INTERVAL) {
+    lastHistoryLogTime = millis();
+    return true;
+  }
+
+  return false;
 }
 
 void setupRtcAndScheduleStorage() {
@@ -1268,11 +1435,11 @@ void setupRtcAndScheduleStorage() {
   ds3231Available = isI2CDeviceAvailable(DS3231_ADDRESS);
   at24c32Available = isI2CDeviceAvailable(AT24C32_ADDRESS);
 
-  Serial.print("DS3231 RTC: ");
-  Serial.println(ds3231Available ? "detected" : "not detected");
+  DEBUG_PRINT("DS3231 RTC: ");
+  DEBUG_PRINTLN(ds3231Available ? "detected" : "not detected");
 
-  Serial.print("AT24C32 EEPROM: ");
-  Serial.println(at24c32Available ? "detected" : "not detected");
+  DEBUG_PRINT("AT24C32 EEPROM: ");
+  DEBUG_PRINTLN(at24c32Available ? "detected" : "not detected");
 
   clearSchedules();
 
@@ -1284,9 +1451,9 @@ void setupRtcAndScheduleStorage() {
 
   if (rtcNow.valid) {
     setSoftwareClock(rtcNow);
-    Serial.println("System time loaded from DS3231 RTC.");
+    DEBUG_PRINTLN("System time loaded from DS3231 RTC.");
   } else if (ds3231Available) {
-    Serial.println("DS3231 time is not valid yet. Set time from Android.");
+    DEBUG_PRINTLN("DS3231 time is not valid yet. Set time from Android.");
   }
 }
 
@@ -1300,7 +1467,7 @@ void updateRtcFromJson(JsonObject rtcConfig) {
 
   if (currentRtc.valid && !forceUpdate) {
     setSoftwareClock(currentRtc);
-    Serial.println("RTC MQTT payload ignored. Time remains locked to DS3231.");
+    DEBUG_PRINTLN("RTC MQTT payload ignored. Time remains locked to DS3231.");
     return;
   }
 
@@ -1322,7 +1489,7 @@ void updateRtcFromJson(JsonObject rtcConfig) {
   if (dateTime.valid) {
     setCurrentDateTime(dateTime);
   } else {
-    Serial.println("Invalid time payload. System time not updated.");
+    DEBUG_PRINTLN("Invalid time payload. System time not updated.");
   }
 }
 
@@ -1360,16 +1527,142 @@ void updateSchedulesFromJson(JsonArray schedules) {
     index++;
   }
 
-  Serial.println("Relay schedules updated from Android.");
+  DEBUG_PRINTLN("Relay schedules updated from Android.");
   saveSchedulesToEeprom();
+}
+
+void setupLittleFS() {
+  if (!LittleFS.begin(false)) {
+    DEBUG_PRINTLN("LittleFS mount failed!");
+    littleFsReady = false;
+    return;
+  }
+
+  littleFsReady = true;
+
+  DEBUG_PRINTLN("LittleFS mounted successfully.");
+
+  size_t totalBytes = LittleFS.totalBytes();
+  size_t usedBytes = LittleFS.usedBytes();
+
+  DEBUG_PRINT("LittleFS Total: ");
+  DEBUG_PRINT(totalBytes);
+  DEBUG_PRINTLN(" bytes");
+
+  DEBUG_PRINT("LittleFS Used : ");
+  DEBUG_PRINT(usedBytes);
+  DEBUG_PRINTLN(" bytes");
+}
+
+void syncOfflineDataToMqtt() {
+  if (!littleFsReady) {
+    return;
+  }
+
+  if (!client.connected()) {
+    return;
+  }
+
+  if (millis() - lastOfflineSyncTime < OFFLINE_SYNC_INTERVAL) {
+    return;
+  }
+
+  lastOfflineSyncTime = millis();
+
+  if (!LittleFS.exists(OFFLINE_LOG_FILE)) {
+    return;
+  }
+
+  File sourceFile = LittleFS.open(OFFLINE_LOG_FILE, FILE_READ);
+
+  if (!sourceFile) {
+    DEBUG_PRINTLN("Failed to open offline log file for reading.");
+    return;
+  }
+
+  File tempFile = LittleFS.open(OFFLINE_TEMP_FILE, FILE_WRITE);
+
+  if (!tempFile) {
+    DEBUG_PRINTLN("Failed to open temp offline log file.");
+    sourceFile.close();
+    return;
+  }
+
+  int syncedThisLoop = 0;
+  bool syncLimitReached = false;
+
+  while (sourceFile.available()) {
+    String line = sourceFile.readStringUntil('\n');
+    line.trim();
+
+    if (line.length() == 0) {
+      continue;
+    }
+
+    if (syncedThisLoop < MAX_SYNC_PER_LOOP && !syncLimitReached) {
+      DEBUG_PRINTLN("Syncing offline payload:");
+      DEBUG_PRINTLN(line);
+
+      bool published = client.publish(historyTopic , line.c_str());
+
+      if (published) {
+        syncedThisLoop++;
+        offlineSyncedCount++;
+
+        DEBUG_PRINT("Offline payload synced. Total synced: ");
+        DEBUG_PRINTLN(offlineSyncedCount);
+
+        client.loop();
+        delay(50);
+      } else {
+        DEBUG_PRINTLN("Failed to publish offline payload. Keeping data.");
+        tempFile.println(line);
+        syncLimitReached = true;
+      }
+    } else {
+      tempFile.println(line);
+    }
+  }
+
+  sourceFile.close();
+  tempFile.close();
+
+  LittleFS.remove(OFFLINE_LOG_FILE);
+
+  File checkTemp = LittleFS.open(OFFLINE_TEMP_FILE, FILE_READ);
+
+  if (checkTemp && checkTemp.size() > 0) {
+    checkTemp.close();
+    LittleFS.rename(OFFLINE_TEMP_FILE, OFFLINE_LOG_FILE);
+    DEBUG_PRINTLN("Some offline data still pending.");
+  } else {
+    if (checkTemp) {
+      checkTemp.close();
+    }
+
+    LittleFS.remove(OFFLINE_TEMP_FILE);
+    DEBUG_PRINTLN("All offline data synced successfully.");
+  }
+}
+
+void updateFloatIfPresent(JsonDocument &doc, const char* key, float &target) {
+  if (doc.containsKey(key)) {
+    target = doc[key].as<float>();
+  }
+}
+
+void updateBoolIfPresent(JsonObject obj, const char* key, bool &target) {
+  if (obj.containsKey(key)) {
+    target = obj[key].as<bool>();
+  }
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
   String topicStr = String(topic);
 
-  Serial.print("Message arrived [");
-  Serial.print(topicStr);
-  Serial.println("]");
+  DEBUG_PRINT("Message arrived [");
+  DEBUG_PRINT(topicStr);
+  DEBUG_PRINTLN("]");
 
   String message;
 
@@ -1377,28 +1670,31 @@ void callback(char* topic, byte* payload, unsigned int length) {
     message += (char)payload[i];
   }
 
-  Serial.println(message);
+  DEBUG_PRINTLN(message);
 
   DynamicJsonDocument doc(2048);
 
   DeserializationError error = deserializeJson(doc, message);
 
   if (error) {
-    Serial.print("JSON Parse Failed: ");
-    Serial.println(error.c_str());
+    DEBUG_PRINT("JSON Parse Failed: ");
+    DEBUG_PRINTLN(error.c_str());
     return;
   }
 
-  Serial.println("=== JSON RECEIVED ===");
-  serializeJsonPretty(doc, Serial);
-  Serial.println();
+  DEBUG_PRINTLN("=== JSON RECEIVED ===");
+
+  #if DEBUG_MODE
+    serializeJsonPretty(doc, Serial);
+    DEBUG_PRINTLN_EMPTY();
+  #endif
 
   // =====================================================
   // MQTT TOPIC : nutrixense/control
   // =====================================================
   if (topicStr == "nutrixense/control") {
-    Serial.println("=== RELAY CONTROL ===");
-
+    DEBUG_PRINTLN("=== RELAY CONTROL ===");
+    bool relayCommandReceived = false;
     const char* commandSource = doc["source"] | "";
     bool isManualCommand =
       strcmp(commandSource, "manual") == 0 || doc.containsKey("manual_override");
@@ -1411,6 +1707,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
         continue;
       }
 
+      relayCommandReceived = true;
       int state = doc[relayKey].as<int>();
       bool isOn = state == 1;
 
@@ -1420,28 +1717,25 @@ void callback(char* topic, byte* payload, unsigned int length) {
         manualOverrideActive[relay - 1] = false;
         setRelayState(relay, isOn);
 
-        Serial.print("Relay");
-        Serial.print(relay);
-        Serial.print(": ");
-        Serial.println(isOn ? "ON" : "OFF");
+        DEBUG_PRINT("Relay");
+        DEBUG_PRINT(relay);
+        DEBUG_PRINT(": ");
+        DEBUG_PRINTLN(isOn ? "ON" : "OFF");
       }
+    }
+
+    if (relayCommandReceived) {
+      publishRelayStatusNow("relay_status");
     }
   }
 
   // =====================================================
   // MQTT TOPIC : nutrixense/schedule
-  // Payload example:
-  // {
-  //   "rtc": {"year":2026,"month":7,"day":2,"hour":6,"minute":30,"second":0,"day_of_week":5},
-  //   "schedules": [
-  //     {"enabled":true,"relay":1,"start_date":"2026-07-02","end_date":"2026-12-31","time":"06:30","duration_seconds":5,"days":[2,3,4,5,6]}
-  //   ]
-  // }
   // RTC is written only when DS3231 time is invalid, or rtc.force_update=true.
   // Schedules are saved to AT24C32.
   // =====================================================
   else if (topicStr == "nutrixense/schedule") {
-    Serial.println("=== SCHEDULE CONFIG ===");
+    DEBUG_PRINTLN("=== SCHEDULE CONFIG ===");
 
     updateRtcFromJson(doc["rtc"].as<JsonObject>());
 
@@ -1454,77 +1748,37 @@ void callback(char* topic, byte* payload, unsigned int length) {
   // MQTT TOPIC : nutrixense/config
   // =====================================================
   else if (topicStr == "nutrixense/config") {
-    Serial.println("=== THRESHOLD CONFIG ===");
+    DEBUG_PRINTLN("=== THRESHOLD CONFIG ===");
 
-    if (doc.containsKey("min_nitrogen")) {
-      MIN_NITROGEN = doc["min_nitrogen"].as<float>();
-    }
+    updateFloatIfPresent(doc, "min_nitrogen", MIN_NITROGEN);
+    updateFloatIfPresent(doc, "min_phosphorus", MIN_PHOSPHORUS);
+    updateFloatIfPresent(doc, "min_potassium", MIN_POTASSIUM);
+    updateFloatIfPresent(doc, "min_ph", MIN_PH);
+    updateFloatIfPresent(doc, "min_moisture", MIN_MOISTURE);
+    updateFloatIfPresent(doc, "min_temperature", MIN_TEMPERATURE);
+    updateFloatIfPresent(doc, "min_ec", MIN_EC);
 
-    if (doc.containsKey("min_phosphorus")) {
-      MIN_PHOSPHORUS = doc["min_phosphorus"].as<float>();
-    }
+    updateFloatIfPresent(doc, "max_nitrogen", MAX_NITROGEN);
+    updateFloatIfPresent(doc, "max_phosphorus", MAX_PHOSPHORUS);
+    updateFloatIfPresent(doc, "max_potassium", MAX_POTASSIUM);
+    updateFloatIfPresent(doc, "max_ph", MAX_PH);
+    updateFloatIfPresent(doc, "max_moisture", MAX_MOISTURE);
+    updateFloatIfPresent(doc, "max_temperature", MAX_TEMPERATURE);
+    updateFloatIfPresent(doc, "max_ec", MAX_EC);
 
-    if (doc.containsKey("min_potassium")) {
-      MIN_POTASSIUM = doc["min_potassium"].as<float>();
-    }
-
-    if (doc.containsKey("min_ph")) {
-      MIN_PH = doc["min_ph"].as<float>();
-    }
-
-    if (doc.containsKey("min_moisture")) {
-      MIN_MOISTURE = doc["min_moisture"].as<float>();
-    }
-
-    if (doc.containsKey("min_temperature")) {
-      MIN_TEMPERATURE = doc["min_temperature"].as<float>();
-    }
-
-    if (doc.containsKey("min_ec")) {
-      MIN_EC = doc["min_ec"].as<float>();
-    }
-
-    if (doc.containsKey("max_nitrogen")) {
-      MAX_NITROGEN = doc["max_nitrogen"].as<float>();
-    }
-
-    if (doc.containsKey("max_phosphorus")) {
-      MAX_PHOSPHORUS = doc["max_phosphorus"].as<float>();
-    }
-
-    if (doc.containsKey("max_potassium")) {
-      MAX_POTASSIUM = doc["max_potassium"].as<float>();
-    }
-
-    if (doc.containsKey("max_ph")) {
-      MAX_PH = doc["max_ph"].as<float>();
-    }
-
-    if (doc.containsKey("max_moisture")) {
-      MAX_MOISTURE = doc["max_moisture"].as<float>();
-    }
-
-    if (doc.containsKey("max_temperature")) {
-      MAX_TEMPERATURE = doc["max_temperature"].as<float>();
-    }
-
-    if (doc.containsKey("max_ec")) {
-      MAX_EC = doc["max_ec"].as<float>();
-    }
-
-    Serial.println("=== THRESHOLD UPDATED ===");
+    DEBUG_PRINTLN("=== THRESHOLD UPDATED ===");
     printThresholds();
 
     if (doc.containsKey("buzzer_muted")) {
       JsonObject muted = doc["buzzer_muted"];
 
-      if (muted.containsKey("nitrogen")) MUTE_NITROGEN = muted["nitrogen"].as<bool>();
-      if (muted.containsKey("phosphorus")) MUTE_PHOSPHORUS = muted["phosphorus"].as<bool>();
-      if (muted.containsKey("potassium")) MUTE_POTASSIUM = muted["potassium"].as<bool>();
-      if (muted.containsKey("ph")) MUTE_PH = muted["ph"].as<bool>();
-      if (muted.containsKey("moisture")) MUTE_MOISTURE = muted["moisture"].as<bool>();
-      if (muted.containsKey("temperature")) MUTE_TEMPERATURE = muted["temperature"].as<bool>();
-      if (muted.containsKey("ec")) MUTE_EC = muted["ec"].as<bool>();
+      updateBoolIfPresent(muted, "nitrogen", MUTE_NITROGEN);
+      updateBoolIfPresent(muted, "phosphorus", MUTE_PHOSPHORUS);
+      updateBoolIfPresent(muted, "potassium", MUTE_POTASSIUM);
+      updateBoolIfPresent(muted, "ph", MUTE_PH);
+      updateBoolIfPresent(muted, "moisture", MUTE_MOISTURE);
+      updateBoolIfPresent(muted, "temperature", MUTE_TEMPERATURE);
+      updateBoolIfPresent(muted, "ec", MUTE_EC);
     }
 
     if (
@@ -1537,7 +1791,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
       MIN_EC <= 0
     ) {
       digitalWrite(BUZZER_PIN, BUZZER_OFF);
-      Serial.println("All minimum thresholds are 0. Buzzer forced OFF.");
+      DEBUG_PRINTLN("All minimum thresholds are 0. Buzzer forced OFF.");
     }
   }
 
@@ -1545,55 +1799,35 @@ void callback(char* topic, byte* payload, unsigned int length) {
   // UNKNOWN TOPIC
   // =====================================================
   else {
-    Serial.print("Unknown MQTT Topic: ");
-    Serial.println(topicStr);
+    DEBUG_PRINT("Unknown MQTT Topic: ");
+    DEBUG_PRINTLN(topicStr);
   }
 }
 
 void setup() {
   Serial.begin(115200);
+  setupLittleFS();
   setupRtcAndScheduleStorage();
+  setupRelays();
 
-  // ================= RELAY SETUP =================
-  pinMode(RELAY1, OUTPUT);
-  pinMode(RELAY2, OUTPUT);
-  pinMode(RELAY3, OUTPUT);
-  pinMode(RELAY4, OUTPUT);
-
-  // Relay OFF awal
-  digitalWrite(RELAY1, RELAY_OFF);
-  digitalWrite(RELAY2, RELAY_OFF);
-  digitalWrite(RELAY3, RELAY_OFF);
-  digitalWrite(RELAY4, RELAY_OFF);
-
-  // ================= BUZZER SETUP =================
   pinMode(BUZZER_PIN, OUTPUT);
-
-  // Buzzer awal mati
   digitalWrite(BUZZER_PIN, BUZZER_OFF);
   lastBuzzerAlertTime = millis() - BUZZER_ALERT_INTERVAL;
 
-  // ================= LCD SETUP =================
   setupLcd();
   showStartupScreen();
   lcdScreenStartedAt = millis();
 
-  // Setup pin MAX485
   pinMode(MAX485_DE_RE, OUTPUT);
   digitalWrite(MAX485_DE_RE, LOW);
 
-  // Serial RS485 Communication
   Serial2.begin(4800, SERIAL_8N1, RXD2, TXD2);
-
-  // Slave ID sensor default = 1
   node.begin(1, Serial2);
-
   node.preTransmission(preTransmission);
   node.postTransmission(postTransmission);
 
   setup_wifi();
 
-  // SSL for HiveMQ Cloud
   espClient.setInsecure();
 
   client.setServer(mqtt_server, mqtt_port);
@@ -1601,22 +1835,23 @@ void setup() {
   client.setBufferSize(2048);
   client.setSocketTimeout(2);
 
-  Serial.println("System Ready...");
+  DEBUG_PRINTLN("System Ready...");
 }
 
 void loop() {
   maintainNetwork();
+
+  if (client.connected()) {
+    syncOfflineDataToMqtt();
+  }
+
   RtcDateTime now = readCurrentDateTime();
   applyRelaySchedules(now);
   maintainLcdDisplay();
   maintainBuzzer(currentNutrientAbnormal);
 
   if (millis() - lastReadTime >= READ_INTERVAL) {
-    Serial.println("\n===== READING SENSOR =====");
-
-    sensorReadSuccess = true;
-
-    uint8_t result = node.readHoldingRegisters(0x00, 7);
+    DEBUG_PRINTLN("\n===== READING SENSOR =====");
 
     float moisture = 0;
     float temperature = 0;
@@ -1626,70 +1861,50 @@ void loop() {
     float phosphorus = 0;
     float potassium = 0;
 
-    if (result == node.ku8MBSuccess) {
-      moisture =
-        node.getResponseBuffer(0) / 10.0;
+    bool sensorReadSuccess = readSensorData(
+      moisture,
+      temperature,
+      ec,
+      ph,
+      nitrogen,
+      phosphorus,
+      potassium
+    );
 
-      int16_t tempRaw =
-        (int16_t)node.getResponseBuffer(1);
+    DEBUG_PRINTLN("===== HASIL SENSOR =====");
 
-      temperature =
-        tempRaw / 10.0;
+    DEBUG_PRINT("Soil Moisture : ");
+    DEBUG_PRINT(moisture);
+    DEBUG_PRINTLN(" %");
 
-      ec =
-        node.getResponseBuffer(2) / 1000.0;
+    DEBUG_PRINT("Temperature   : ");
+    DEBUG_PRINT(temperature);
+    DEBUG_PRINTLN(" C");
 
-      ph =
-        node.getResponseBuffer(3) / 10.0;
+    DEBUG_PRINT("EC            : ");
+    DEBUG_PRINT(ec);
+    DEBUG_PRINTLN(" mS/cm");
 
-      nitrogen =
-        node.getResponseBuffer(4);
+    DEBUG_PRINT("pH            : ");
+    DEBUG_PRINTLN(ph);
 
-      phosphorus =
-        node.getResponseBuffer(5);
+    DEBUG_PRINT("Nitrogen      : ");
+    DEBUG_PRINT(nitrogen);
+    DEBUG_PRINTLN(" mg/kg");
 
-      potassium =
-        node.getResponseBuffer(6);
+    DEBUG_PRINT("Phosphorus    : ");
+    DEBUG_PRINT(phosphorus);
+    DEBUG_PRINTLN(" mg/kg");
 
-    } else {
-      sensorReadSuccess = false;
-      Serial.println("FAILED reading sensor registers!");
-    }
+    DEBUG_PRINT("Potassium     : ");
+    DEBUG_PRINT(potassium);
+    DEBUG_PRINTLN(" mg/kg");
 
-    Serial.println("===== HASIL SENSOR =====");
-
-    Serial.print("Soil Moisture : ");
-    Serial.print(moisture);
-    Serial.println(" %");
-
-    Serial.print("Temperature   : ");
-    Serial.print(temperature);
-    Serial.println(" C");
-
-    Serial.print("EC            : ");
-    Serial.print(ec);
-    Serial.println(" mS/cm");
-
-    Serial.print("pH            : ");
-    Serial.println(ph);
-
-    Serial.print("Nitrogen      : ");
-    Serial.print(nitrogen);
-    Serial.println(" mg/kg");
-
-    Serial.print("Phosphorus    : ");
-    Serial.print(phosphorus);
-    Serial.println(" mg/kg");
-
-    Serial.print("Potassium     : ");
-    Serial.print(potassium);
-    Serial.println(" mg/kg");
-
-    Serial.println("==========================");
+    DEBUG_PRINTLN("==========================");
 
     if (!sensorReadSuccess) {
-      Serial.println("Sensor read failed!");
-      Serial.println("Skipping threshold check...");
+      DEBUG_PRINTLN("Sensor read failed!");
+      DEBUG_PRINTLN("Skipping threshold check...");
 
       currentNutrientAbnormal = false;
       hasValidSensorData = false;
@@ -1726,61 +1941,66 @@ void loop() {
      isActiveAbnormal(temperature, MIN_TEMPERATURE, MAX_TEMPERATURE, MUTE_TEMPERATURE) ||
      isActiveAbnormal(ec, MIN_EC, MAX_EC, MUTE_EC);
 
-    Serial.print("nutrientAbnormal = ");
-    Serial.println(nutrientAbnormal ? "TRUE" : "FALSE");
+    DEBUG_PRINT("nutrientAbnormal = ");
+    DEBUG_PRINTLN(nutrientAbnormal ? "TRUE" : "FALSE");
     currentNutrientAbnormal = nutrientAbnormal;
 
     if (nutrientAbnormal) {
-      Serial.println("WARNING: Nutrisi di bawah ambang normal!");
-      Serial.println("Buzzer beep pattern armed");
+      DEBUG_PRINTLN("WARNING: Nutrisi di bawah ambang normal!");
+      DEBUG_PRINTLN("Buzzer beep pattern armed");
     } else {
-      Serial.println("Nutrisi Normal");
-      Serial.println("Buzzer OFF");
+      DEBUG_PRINTLN("Nutrisi Normal");
+      DEBUG_PRINTLN("Buzzer OFF");
     }
 
-    String payload = "{";
+    String payload = buildSensorPayload(
+      moisture, temperature, ec, ph,
+      nitrogen, phosphorus, potassium,
+      now,
+      "realtime"
+    );
 
-    payload += "\"moisture\":" + String(moisture, 1) + ",";
-    payload += "\"temperature\":" + String(temperature, 1) + ",";
-    payload += "\"ec\":" + String(ec, 2) + ",";
-    payload += "\"ph\":" + String(ph, 1) + ",";
-    payload += "\"nitrogen\":" + String(nitrogen, 1) + ",";
-    payload += "\"phosphorus\":" + String(phosphorus, 1) + ",";
-    payload += "\"potassium\":" + String(potassium, 1);
-    payload += ",\"relay1\":" + String(digitalRead(RELAY1) == RELAY_ON ? 1 : 0);
-    payload += ",\"relay2\":" + String(digitalRead(RELAY2) == RELAY_ON ? 1 : 0);
-    payload += ",\"relay3\":" + String(digitalRead(RELAY3) == RELAY_ON ? 1 : 0);
-    payload += ",\"relay4\":" + String(digitalRead(RELAY4) == RELAY_ON ? 1 : 0);
-    payload += ",\"buzzer\":" + String(digitalRead(BUZZER_PIN) == BUZZER_ON ? 1 : 0);
-    payload += ",\"rtc_valid\":" + String(now.valid ? 1 : 0);
-    payload += ",\"rtc_available\":" + String(ds3231Available ? 1 : 0);
-    payload += ",\"schedule_storage\":" + String(at24c32Available ? 1 : 0);
-
-    if (now.valid) {
-      payload += ",\"rtc\":{";
-      payload += "\"year\":" + String(now.year) + ",";
-      payload += "\"month\":" + String(now.month) + ",";
-      payload += "\"day\":" + String(now.day) + ",";
-      payload += "\"hour\":" + String(now.hour) + ",";
-      payload += "\"minute\":" + String(now.minute) + ",";
-      payload += "\"second\":" + String(now.second) + ",";
-      payload += "\"day_of_week\":" + String(now.dayOfWeek);
-      payload += "}";
-    }
-
-    payload += "}";
-
+    // ================= REALTIME MQTT SETIAP 2 DETIK =================
     if (client.connected()) {
-      Serial.println("Sending MQTT:");
-      Serial.println(payload);
+      DEBUG_PRINTLN("Sending realtime MQTT:");
+      DEBUG_PRINTLN(payload);
 
-      if (client.publish(topic, payload.c_str())) {
-        Serial.println("MQTT Publish Success");
+      if (client.publish(realtimeTopic, payload.c_str())) {
+        DEBUG_PRINTLN("Realtime MQTT Publish Success");
       } else {
-        Serial.println("MQTT Publish Failed");
+        DEBUG_PRINTLN("Realtime MQTT Publish Failed");
       }
     } else {
-      Serial.println("MQTT offline. Sensor data shown on LCD only.");
+      DEBUG_PRINTLN("MQTT offline. Realtime data only shown on LCD.");
+    }
+
+    // ================= HISTORICAL LOG SETIAP 1 MENIT =================
+    if (shouldLogHistory()) {
+      String historyPayload = payload;
+
+      if (client.connected()) {
+        historyPayload.replace("\"source\":\"realtime\"", "\"source\":\"history\"");
+
+        DEBUG_PRINTLN("Sending history MQTT:");
+        DEBUG_PRINTLN(historyPayload);
+
+        if (client.publish(historyTopic, historyPayload.c_str())) {
+          DEBUG_PRINTLN("History MQTT Publish Success");
+        } else {
+          DEBUG_PRINTLN("History MQTT Publish Failed. Saving to LittleFS.");
+
+          historyPayload.replace("\"source\":\"history\"", "\"source\":\"offline_cache\"");
+          savePayloadToLittleFS(historyPayload);
+        }
+
+      } else {
+        historyPayload.replace("\"source\":\"realtime\"", "\"source\":\"offline_cache\"");
+
+        DEBUG_PRINTLN("MQTT offline. Saving history data to LittleFS:");
+        DEBUG_PRINTLN(historyPayload);
+
+        savePayloadToLittleFS(historyPayload);
+      }
     }
 
     lastReadTime = millis();
