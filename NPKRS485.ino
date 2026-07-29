@@ -23,7 +23,6 @@
 const char* WIFI_MANAGER_AP_NAME = "NutriXense";
 const char* WIFI_MANAGER_AP_PASSWORD = "12345678";
 WiFiManager wifiManager;
-const unsigned long WIFI_PORTAL_REOPEN_DELAY = 10000;
 unsigned long wifiDisconnectedSince = 0;
 
 // ================= HIVEMQ =================
@@ -48,7 +47,6 @@ unsigned long offlineSyncedCount = 0;
 // ================= MQTT =================
 WiFiClientSecure espClient;
 PubSubClient client(espClient);
-const byte MQTT_FAILURES_BEFORE_PORTAL = 5;
 byte mqttFailedAttempts = 0;
 
 // Inisialisasi Modbus
@@ -104,7 +102,11 @@ const unsigned long HISTORY_LOG_INTERVAL = 60000;
 unsigned long lastHistoryLogTime = 0;
 
 const unsigned long WIFI_RETRY_INTERVAL = 15000;
-const unsigned long WIFI_CONNECT_TIMEOUT_SECONDS = 5;
+const unsigned long WIFI_PORTAL_OPEN_DELAY = 60000;
+const unsigned long WIFI_PORTAL_MAX_DURATION = 300000;
+const unsigned long WIFI_CONNECT_TIMEOUT_SECONDS = 20;
+unsigned long wifiPortalStartedAt = 0;
+
 const unsigned long MQTT_RETRY_INTERVAL = 5000;
 const unsigned long STARTUP_SCREEN_DURATION = 3000;
 const unsigned long STARTUP_ANIMATION_INTERVAL = 500;
@@ -131,6 +133,7 @@ bool buzzerOutputState = false;
 
 bool currentNutrientAbnormal = false;
 bool hasValidSensorData = false;
+bool offlineFileConflict = false;
 
 float lastMoisture = 0;
 float lastTemperature = 0;
@@ -150,6 +153,9 @@ struct RtcDateTime {
   byte dayOfWeek;
   bool valid;
 };
+
+// Forward declaration
+String formatTimestamp(const RtcDateTime &now);
 
 RtcDateTime softwareClockBase;
 unsigned long softwareClockSetMillis = 0;
@@ -827,12 +833,23 @@ void printThresholdCheck(float nitrogen, float phosphorus, float potassium, floa
 // ================= WIFI =================
 void setup_wifi() {
   DEBUG_PRINTLN("Starting WiFiManager...");
+
+  WiFi.setAutoReconnect(false);
   WiFi.mode(WIFI_STA);
 
+  // Hentikan koneksi STA sebelumnya tanpa menghapus SSID.
+  WiFi.disconnect(false, false);
+  delay(300);
+
+  wifiManager.setDebugOutput(DEBUG_MODE == 1);
+  wifiManager.setCleanConnect(true);
   wifiManager.setConnectTimeout(WIFI_CONNECT_TIMEOUT_SECONDS);
   wifiManager.setConfigPortalBlocking(false);
+  wifiManager.setWiFiAutoReconnect(false);
+  wifiManager.setMinimumSignalQuality(0);
+  wifiManager.setRemoveDuplicateAPs(false);
 
-  // Uncomment this line only when you want to erase saved WiFi credentials.
+  // Jangan aktifkan pada program final.
   // wifiManager.resetSettings();
 
   bool connected = wifiManager.autoConnect(WIFI_MANAGER_AP_NAME, WIFI_MANAGER_AP_PASSWORD);
@@ -840,20 +857,26 @@ void setup_wifi() {
   wifiStarted = true;
   lastWifiAttemptTime = millis();
 
-  if (!connected) {
-    wifiManagerPortalRunning = true;
-    wifiConnectedLogged = false;
-    DEBUG_PRINTLN("WiFi not connected yet.");
-    DEBUG_PRINT("Config portal active. Connect your phone to AP: ");
-    DEBUG_PRINTLN(WIFI_MANAGER_AP_NAME);
+  if (connected || WiFi.status() == WL_CONNECTED) {
+    wifiManagerPortalRunning = false;
+    wifiConnectedLogged = true;
+
+    WiFi.setAutoReconnect(false);
+
+    DEBUG_PRINTLN("WiFi connected.");
+    DEBUG_PRINT("IP address: ");
+    DEBUG_PRINTLN(WiFi.localIP());
     return;
   }
 
-  wifiManagerPortalRunning = false;
-  wifiConnectedLogged = true;
-  DEBUG_PRINTLN("WiFi connected.");
-  DEBUG_PRINT("IP address: ");
-  DEBUG_PRINTLN(WiFi.localIP());
+  // autoConnect non-blocking membuka portal dan kembali ke program.
+  wifiManagerPortalRunning = true;
+  wifiPortalStartedAt = millis();
+  wifiConnectedLogged = false;
+
+  DEBUG_PRINTLN("WiFi not connected.");
+  DEBUG_PRINT("Configuration portal active: ");
+  DEBUG_PRINTLN(WIFI_MANAGER_AP_NAME);
 }
 
 void startWifiConfigPortal() {
@@ -861,34 +884,78 @@ void startWifiConfigPortal() {
     return;
   }
 
-  DEBUG_PRINTLN("Starting NutriXense config portal again...");
-  WiFi.mode(WIFI_AP_STA);
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
 
-  wifiManager.setConfigPortalBlocking(false);
+  DEBUG_PRINTLN("Starting NutriXense config portal...");
+
+  // Cegah proses reconnect otomatis bertabrakan dengan scan.
+  WiFi.setAutoReconnect(false);
+
+  // Batalkan koneksi STA yang masih berjalan,
+  // tanpa menghapus kredensial dari NVS.
+  WiFi.disconnect(false, false);
+  delay(500);
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.scanDelete();
+  delay(200);
+
   wifiManager.startConfigPortal(
     WIFI_MANAGER_AP_NAME,
     WIFI_MANAGER_AP_PASSWORD
   );
 
   wifiManagerPortalRunning = true;
+  wifiPortalStartedAt = millis();
   lastWifiAttemptTime = millis();
+
+  DEBUG_PRINT("Portal IP: ");
+  DEBUG_PRINTLN(WiFi.softAPIP());
 }
 
 void tryReconnectSavedWiFi() {
-  DEBUG_PRINTLN("Trying saved WiFi credentials in background...");
-
+  // Sangat penting:
+  // jangan reconnect ketika portal sedang scan.
   if (wifiManagerPortalRunning) {
-    WiFi.mode(WIFI_AP_STA);
-  } else {
-    WiFi.mode(WIFI_STA);
+    return;
   }
 
-  bool reconnectStarted = WiFi.reconnect();
-  if (!reconnectStarted) {
-    WiFi.begin();
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
   }
+
+  DEBUG_PRINTLN("Trying saved WiFi credentials...");
+
+  WiFi.setAutoReconnect(false);
+  WiFi.mode(WIFI_STA);
+
+  // Membatalkan kemungkinan percobaan sebelumnya.
+  WiFi.disconnect(false, false);
+  delay(150);
+
+  // begin() tanpa parameter menggunakan konfigurasi tersimpan.
+  WiFi.begin();
 
   lastWifiAttemptTime = millis();
+}
+
+void stopWifiConfigPortalSafe() {
+  if (!wifiManagerPortalRunning) {
+    return;
+  }
+
+  DEBUG_PRINTLN("Stopping WiFi configuration portal...");
+
+  wifiManager.stopConfigPortal();
+  WiFi.softAPdisconnect(false);
+
+  wifiManagerPortalRunning = false;
+  wifiPortalStartedAt = 0;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(false);
 }
 
 // ================= MQTT CONNECT =================
@@ -913,64 +980,111 @@ void reconnect() {
     client.subscribe("nutrixense/schedule");
     DEBUG_PRINTLN("Subscribed: nutrixense/schedule");
   } else {
-    mqttFailedAttempts++;
-
-    DEBUG_PRINT("Failed, rc=");
-    DEBUG_PRINT(client.state());
-    DEBUG_PRINT(" MQTT failed attempts=");
-    DEBUG_PRINTLN(mqttFailedAttempts);
-
-    if (mqttFailedAttempts >= MQTT_FAILURES_BEFORE_PORTAL) {
-      startWifiConfigPortal();
+    if (mqttFailedAttempts < 255) {
+      mqttFailedAttempts++;
     }
 
-    DEBUG_PRINTLN(" will retry later.");
+    DEBUG_PRINT("MQTT Failed, rc=");
+    DEBUG_PRINT(client.state());
+    DEBUG_PRINT(" attempts=");
+    DEBUG_PRINTLN(mqttFailedAttempts);
+
+    DEBUG_PRINTLN("MQTT will retry later.");
   }
 }
 
 void maintainNetwork() {
-  if (wifiStarted) {
+  if (!wifiStarted) {
+    setup_wifi();
+    return;
+  }
+
+  // Portal non-blocking wajib diproses secara rutin.
+  if (wifiManagerPortalRunning) {
     wifiManager.process();
   }
 
-  if (WiFi.status() != WL_CONNECTED) {
-    wifiConnectedLogged = false;
+  // =====================================================
+  // WIFI CONNECTED
+  // =====================================================
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiDisconnectedSince = 0;
 
-    if (wifiDisconnectedSince == 0) {
-      wifiDisconnectedSince = millis();
+    if (wifiManagerPortalRunning) {
+      stopWifiConfigPortalSafe();
     }
 
-    if (!wifiStarted) {
-      setup_wifi();
-      return;
+    if (!wifiConnectedLogged) {
+      wifiConnectedLogged = true;
+
+      DEBUG_PRINTLN("WiFi connected.");
+      DEBUG_PRINT("SSID: ");
+      DEBUG_PRINTLN(WiFi.SSID());
+      DEBUG_PRINT("IP address: ");
+      DEBUG_PRINTLN(WiFi.localIP());
     }
 
-    if (millis() - lastWifiAttemptTime >= WIFI_RETRY_INTERVAL) {
-      tryReconnectSavedWiFi();
+    if (
+      !client.connected() &&
+      millis() - lastMqttAttemptTime >= MQTT_RETRY_INTERVAL
+    ) {
+      reconnect();
     }
 
-    if (millis() - wifiDisconnectedSince >= WIFI_PORTAL_REOPEN_DELAY) {
-      startWifiConfigPortal();
+    if (client.connected()) {
+      client.loop();
     }
 
     return;
   }
 
-  wifiDisconnectedSince = 0;
-
-  if (!wifiConnectedLogged) {
-    wifiConnectedLogged = true;
-    DEBUG_PRINTLN("WiFi connected.");
-    DEBUG_PRINT("IP address: ");
-    DEBUG_PRINTLN(WiFi.localIP());
-  }
-
-  if (!client.connected() && millis() - lastMqttAttemptTime >= MQTT_RETRY_INTERVAL) {
-    reconnect();
-  }
+  // =====================================================
+  // WIFI DISCONNECTED
+  // =====================================================
+  wifiConnectedLogged = false;
 
   if (client.connected()) {
-    client.loop();
+    client.disconnect();
+  }
+
+  if (wifiDisconnectedSince == 0) {
+    wifiDisconnectedSince = millis();
+  }
+
+  // Saat portal aktif, jangan memanggil begin/reconnect/mode.
+  if (wifiManagerPortalRunning) {
+    if (
+      millis() - wifiPortalStartedAt >=
+      WIFI_PORTAL_MAX_DURATION
+    ) {
+      DEBUG_PRINTLN("Portal timeout. Closing portal.");
+      stopWifiConfigPortalSafe();
+
+      // Mulai ulang periode pencarian WiFi tersimpan.
+      wifiDisconnectedSince = millis();
+
+      // Agar percobaan reconnect dapat dilakukan segera.
+      lastWifiAttemptTime = millis() - WIFI_RETRY_INTERVAL;
+    }
+
+    return;
+  }
+
+  // Beri kesempatan reconnect selama satu menit dahulu.
+  if (
+    millis() - wifiDisconnectedSince >=
+    WIFI_PORTAL_OPEN_DELAY
+  ) {
+    startWifiConfigPortal();
+    return;
+  }
+
+  // Percobaan koneksi tersimpan dilakukan berkala.
+  if (
+    millis() - lastWifiAttemptTime >=
+    WIFI_RETRY_INTERVAL
+  ) {
+    tryReconnectSavedWiFi();
   }
 }
 
@@ -1554,8 +1668,89 @@ void setupLittleFS() {
   DEBUG_PRINTLN(" bytes");
 }
 
+void inspectLittleFS() {
+  Serial.println();
+  Serial.println("===== LITTLEFS INSPECTION =====");
+
+  if (!littleFsReady) {
+    Serial.println("ERROR: LittleFS belum siap.");
+    return;
+  }
+
+  Serial.printf("Total LittleFS : %u bytes\n", LittleFS.totalBytes());
+  Serial.printf("Used LittleFS  : %u bytes\n", LittleFS.usedBytes());
+
+  File root = LittleFS.open("/");
+
+  if (!root || !root.isDirectory()) {
+    Serial.println("Gagal membuka direktori root LittleFS.");
+    return;
+  }
+
+  File file = root.openNextFile();
+
+  while (file) {
+    Serial.printf(
+      "File: %s | Size: %u bytes\n",
+      file.name(),
+      static_cast<unsigned int>(file.size())
+    );
+
+    file.close();
+    file = root.openNextFile();
+  }
+
+  root.close();
+  Serial.println("===============================");
+}
+
+void recoverOfflineTempFile() {
+  if (!littleFsReady) {
+    return;
+  }
+
+  bool logExists = LittleFS.exists(OFFLINE_LOG_FILE);
+  bool tempExists = LittleFS.exists(OFFLINE_TEMP_FILE);
+
+  if (!logExists && tempExists) {
+    Serial.println(
+      "Recovering offline log from temporary file..."
+    );
+
+    if (LittleFS.rename(
+          OFFLINE_TEMP_FILE,
+          OFFLINE_LOG_FILE
+        )) {
+      Serial.println("Temporary offline log recovered.");
+    } else {
+      Serial.println(
+        "ERROR: Failed recovering temporary offline log."
+      );
+    }
+
+    return;
+  }
+
+  if (logExists && tempExists) {
+    offlineFileConflict = true;
+    Serial.println(
+      "WARNING: Both offline and temp files exist."
+    );
+    Serial.println(
+      "Both files are preserved to prevent data loss."
+    );
+  }
+}
+
 void syncOfflineDataToMqtt() {
   if (!littleFsReady) {
+    return;
+  }
+
+  if (offlineFileConflict) {
+    DEBUG_PRINTLN(
+      "Offline sync blocked because both log files exist."
+    );
     return;
   }
 
@@ -1627,21 +1822,51 @@ void syncOfflineDataToMqtt() {
   sourceFile.close();
   tempFile.close();
 
-  LittleFS.remove(OFFLINE_LOG_FILE);
-
   File checkTemp = LittleFS.open(OFFLINE_TEMP_FILE, FILE_READ);
 
-  if (checkTemp && checkTemp.size() > 0) {
+  bool hasPendingData =
+    checkTemp && checkTemp.size() > 0;
+
+  if (checkTemp) {
     checkTemp.close();
-    LittleFS.rename(OFFLINE_TEMP_FILE, OFFLINE_LOG_FILE);
-    DEBUG_PRINTLN("Some offline data still pending.");
-  } else {
-    if (checkTemp) {
-      checkTemp.close();
+  }
+
+  if (!LittleFS.remove(OFFLINE_LOG_FILE)) {
+    DEBUG_PRINTLN(
+      "ERROR: Failed removing original offline log."
+    );
+    DEBUG_PRINTLN(
+      "Original and temporary files are preserved."
+    );
+
+    offlineFileConflict = true;
+    return;
+  }
+
+  if (hasPendingData) {
+    if (!LittleFS.rename(
+          OFFLINE_TEMP_FILE,
+          OFFLINE_LOG_FILE
+        )) {
+      DEBUG_PRINTLN(
+        "ERROR: Failed renaming temporary log."
+      );
+
+      DEBUG_PRINTLN(
+        "Pending data remains in temporary file."
+      );
+
+      offlineFileConflict = true;
+      return;
     }
 
-    LittleFS.remove(OFFLINE_TEMP_FILE);
-    DEBUG_PRINTLN("All offline data synced successfully.");
+    DEBUG_PRINTLN("Some offline data still pending.");
+  } else {
+    if (LittleFS.exists(OFFLINE_TEMP_FILE)) {
+      LittleFS.remove(OFFLINE_TEMP_FILE);
+    }
+
+    DEBUG_PRINTLN("All offline data published.");
   }
 }
 
@@ -1806,7 +2031,12 @@ void callback(char* topic, byte* payload, unsigned int length) {
 
 void setup() {
   Serial.begin(115200);
+  delay(1000);
+
   setupLittleFS();
+  recoverOfflineTempFile();
+  inspectLittleFS();
+
   setupRtcAndScheduleStorage();
   setupRelays();
 
