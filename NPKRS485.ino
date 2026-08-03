@@ -82,7 +82,7 @@ bool littleFsReady = false;
 #define RELAY1 25
 #define RELAY2 26
 #define RELAY3 27
-#define RELAY4 14
+#define RELAY4 33
 #define RELAY_OFF LOW
 #define RELAY_ON HIGH
 const byte RELAY_PINS[4] = { RELAY1, RELAY2, RELAY3, RELAY4 };
@@ -90,8 +90,6 @@ const byte RELAY_PINS[4] = { RELAY1, RELAY2, RELAY3, RELAY4 };
 // ================= BUZZER =================
 #define BUZZER_PIN 18
 
-// If your buzzer still sounds when it should be OFF,
-// swap these two values.
 #define BUZZER_ON HIGH
 #define BUZZER_OFF LOW
 
@@ -161,6 +159,7 @@ RtcDateTime softwareClockBase;
 unsigned long softwareClockSetMillis = 0;
 bool softwareClockValid = false;
 
+// ================= STRUCT PENJADWALAN TERPERBARUI =================
 struct RelaySchedule {
   bool enabled;
   byte relay;
@@ -173,6 +172,7 @@ struct RelaySchedule {
   byte hour;
   byte minute;
   unsigned int durationSeconds;
+  unsigned int startDelaySeconds; // Ditambahkan untuk jeda sekuensial per relay
   byte daysMask;
 };
 
@@ -186,33 +186,25 @@ bool lastScheduleAutoActive[4] = { false, false, false, false };
 const byte SCHEDULE_STORAGE_MAGIC_0 = 'N';
 const byte SCHEDULE_STORAGE_MAGIC_1 = 'X';
 const byte SCHEDULE_STORAGE_MAGIC_2 = 'S';
-const byte SCHEDULE_STORAGE_MAGIC_3 = '1';
-const byte SCHEDULE_STORAGE_VERSION = 1;
+const byte SCHEDULE_STORAGE_MAGIC_3 = '2'; // Version 2
+const byte SCHEDULE_STORAGE_VERSION = 2;
 const byte SCHEDULE_STORAGE_HEADER_BYTES = 8;
-const byte SCHEDULE_STORAGE_RECORD_BYTES = 16;
+const byte SCHEDULE_STORAGE_RECORD_BYTES = 18;
 const uint16_t SCHEDULE_STORAGE_ADDRESS = 0;
 const uint16_t SCHEDULE_STORAGE_TOTAL_BYTES =
   SCHEDULE_STORAGE_HEADER_BYTES + (MAX_SCHEDULES * SCHEDULE_STORAGE_RECORD_BYTES);
 const byte SCHEDULE_STORAGE_CHECKSUM_INDEX = 7;
 
-// ================= NUTRITION THRESHOLD =================
-float MIN_NITROGEN = 40;
-float MIN_PHOSPHORUS = 20;
-float MIN_POTASSIUM = 40;
-
-float MIN_PH = 5.8;
+// ================= THRESHOLD NUTRISI =================
+float MIN_PH = 4.5;
 float MIN_MOISTURE = 40.0;
 float MIN_TEMPERATURE = 18.0;
-float MIN_EC = 1.0;
+float MIN_EC = 0.8;
 
-float MAX_NITROGEN = 80;
-float MAX_PHOSPHORUS = 60;
-float MAX_POTASSIUM = 100;
-
-float MAX_PH = 7.2;
-float MAX_MOISTURE = 80.0;
-float MAX_TEMPERATURE = 35.0;
-float MAX_EC = 3.0;
+float MAX_PH = 5.5;
+float MAX_MOISTURE = 70.0;
+float MAX_TEMPERATURE = 25.0;
+float MAX_EC = 1.8;
 
 // ================= BUZZER MUTE CONFIG =================
 bool MUTE_NITROGEN = false;
@@ -246,63 +238,36 @@ void printPaddedLcdLine(byte row, const String &text) {
 
 void printCenteredLcdLine(byte row, const String &text) {
   int leftPadding = (LCD_COLUMNS - text.length()) / 2;
-
-  if (leftPadding < 0) {
-    leftPadding = 0;
-  }
+  if (leftPadding < 0) leftPadding = 0;
 
   String line = "";
-
-  for (int i = 0; i < leftPadding; i++) {
-    line += ' ';
-  }
-
+  for (int i = 0; i < leftPadding; i++) line += ' ';
   line += text;
   printPaddedLcdLine(row, line);
 }
 
 String formatLcdValue(float value, unsigned int decimals) {
   String formatted = String(value, decimals);
-
-  if (formatted.length() > 4) {
-    formatted = String(value, 0);
-  }
-
-  if (formatted.length() > 4) {
-    formatted = formatted.substring(0, 4);
-  }
-
+  if (formatted.length() > 4) formatted = String(value, 0);
+  if (formatted.length() > 4) formatted = formatted.substring(0, 4);
   return formatted;
 }
 
 String formatNpkValue(float value) {
   String formatted = String((int)round(value));
-
-  while (formatted.length() < 3) {
-    formatted = " " + formatted;
-  }
-
-  if (formatted.length() > 3) {
-    formatted = formatted.substring(0, 3);
-  }
-
+  while (formatted.length() < 3) formatted = " " + formatted;
+  if (formatted.length() > 3) formatted = formatted.substring(0, 3);
   return formatted;
 }
 
 String twoDigits(byte value) {
-  if (value < 10) {
-    return "0" + String(value);
-  }
-
+  if (value < 10) return "0" + String(value);
   return String(value);
 }
 
 void clearLcdLine(byte row) {
   lcd.setCursor(0, row);
-
-  for (int i = 0; i < LCD_COLUMNS; i++) {
-    lcd.print(' ');
-  }
+  for (int i = 0; i < LCD_COLUMNS; i++) lcd.print(' ');
 }
 
 void setupLcd() {
@@ -320,11 +285,7 @@ void showStartupScreen() {
 
   while (millis() - startedAt < STARTUP_SCREEN_DURATION) {
     String loadingText = "Starting";
-
-    for (byte i = 0; i < frame; i++) {
-      loadingText += " .";
-    }
-
+    for (byte i = 0; i < frame; i++) loadingText += " .";
     printCenteredLcdLine(3, loadingText);
     frame = (frame + 1) % 4;
     delay(STARTUP_ANIMATION_INTERVAL);
@@ -333,27 +294,20 @@ void showStartupScreen() {
   lcd.clear();
 }
 
-void displaySensorData(float nitrogen, float phosphorus, float potassium, float ph, float moisture, float temperature) {
-  printCenteredLcdLine(0, "NutriXense");
-
-  printPaddedLcdLine(
-    1,
-    "N:" + formatNpkValue(nitrogen) + " mg/kg pH:" + formatLcdValue(ph, 1)
-  );
-
-  clearLcdLine(2);
-  lcd.setCursor(0, 2);
-  lcd.print("P:");
-  lcd.print(formatNpkValue(phosphorus));
-  lcd.print(" mg/kg T:");
-  lcd.print(formatLcdValue(temperature, 1));
+void displaySensorData(float nitrogen, float phosphorus, float potassium, float ph, float moisture, float temperature, float ec) {
+  printPaddedLcdLine(0, "N:" + formatNpkValue(nitrogen) + " mg/kg pH:" + formatLcdValue(ph, 1));
+  
+  // Format baris ke-2 (P dan Temp) agar rapi dalam 1 fungsi
+  String pLine = "P:" + formatNpkValue(phosphorus) + " mg/kg T:" + formatLcdValue(temperature, 1);
+  lcd.setCursor(0, 1);
+  lcd.print(pLine);
   lcd.write(byte(223));
-  lcd.print("C");
-
-  printPaddedLcdLine(
-    3,
-    "K:" + formatNpkValue(potassium) + " mg/kg M:" + formatLcdValue(moisture, 1) + "%"
-  );
+  lcd.print("C  "); // Sisa spasi penutup
+  // Baris ke-3 (K dan Moisture) - Tanpa clearLcdLine(2)
+  printPaddedLcdLine(2, "K:" + formatNpkValue(potassium) + " mg/kg M:" + formatLcdValue(moisture, 1) + "%");
+  
+  // Baris ke-4 (EC)
+  printCenteredLcdLine(3, "EC:" + formatLcdValue(ec, 2) + " mS/cm");
 }
 
 const char* dayName(byte dayOfWeek) {
@@ -380,14 +334,8 @@ void displayTimeData(const RtcDateTime &now) {
 
   printCenteredLcdLine(0, "NutriXense");
   printCenteredLcdLine(1, dayName(now.dayOfWeek));
-  printCenteredLcdLine(
-    2,
-    twoDigits(now.day) + "/" + twoDigits(now.month) + "/" + String(now.year)
-  );
-  printCenteredLcdLine(
-    3,
-    twoDigits(now.hour) + ":" + twoDigits(now.minute) + ":" + twoDigits(now.second)
-  );
+  printCenteredLcdLine(2, twoDigits(now.day) + "/" + twoDigits(now.month) + "/" + String(now.year));
+  printCenteredLcdLine(3, twoDigits(now.hour) + ":" + twoDigits(now.minute) + ":" + twoDigits(now.second));
 }
 
 void displaySensorError() {
@@ -418,9 +366,7 @@ bool isValidDateTime(const RtcDateTime &dateTime) {
   return dateTime.year >= 2024 && dateTime.year <= 2099 &&
          dateTime.month >= 1 && dateTime.month <= 12 &&
          dateTime.day >= 1 && dateTime.day <= daysInMonth(dateTime.year, dateTime.month) &&
-         dateTime.hour <= 23 &&
-         dateTime.minute <= 59 &&
-         dateTime.second <= 59 &&
+         dateTime.hour <= 23 && dateTime.minute <= 59 && dateTime.second <= 59 &&
          dateTime.dayOfWeek >= 1 && dateTime.dayOfWeek <= 7;
 }
 
@@ -438,10 +384,7 @@ bool isI2CDeviceAvailable(byte address) {
 }
 
 bool writeDs3231Register(byte reg, byte value) {
-  if (!ds3231Available) {
-    return false;
-  }
-
+  if (!ds3231Available) return false;
   Wire.beginTransmission(DS3231_ADDRESS);
   Wire.write(reg);
   Wire.write(value);
@@ -449,35 +392,18 @@ bool writeDs3231Register(byte reg, byte value) {
 }
 
 bool readDs3231Registers(byte startReg, byte *buffer, byte length) {
-  if (!ds3231Available) {
-    return false;
-  }
-
+  if (!ds3231Available) return false;
   Wire.beginTransmission(DS3231_ADDRESS);
   Wire.write(startReg);
-
-  if (Wire.endTransmission(false) != 0) {
-    return false;
-  }
-
+  if (Wire.endTransmission(false) != 0) return false;
   byte readCount = Wire.requestFrom(DS3231_ADDRESS, length);
-
-  if (readCount != length) {
-    return false;
-  }
-
-  for (byte i = 0; i < length; i++) {
-    buffer[i] = Wire.read();
-  }
-
+  if (readCount != length) return false;
+  for (byte i = 0; i < length; i++) buffer[i] = Wire.read();
   return true;
 }
 
 bool writeDs3231DateTime(const RtcDateTime &dateTime) {
-  if (!isValidDateTime(dateTime)) {
-    return false;
-  }
-
+  if (!isValidDateTime(dateTime)) return false;
   Wire.beginTransmission(DS3231_ADDRESS);
   Wire.write(0x00);
   Wire.write(decimalToBcd(dateTime.second));
@@ -487,35 +413,23 @@ bool writeDs3231DateTime(const RtcDateTime &dateTime) {
   Wire.write(decimalToBcd(dateTime.day));
   Wire.write(decimalToBcd(dateTime.month));
   Wire.write(decimalToBcd(dateTime.year - 2000));
-
-  if (Wire.endTransmission() != 0) {
-    return false;
-  }
+  if (Wire.endTransmission() != 0) return false;
 
   byte statusRegister = 0;
-
   if (readDs3231Registers(0x0F, &statusRegister, 1)) {
     writeDs3231Register(0x0F, statusRegister & ~0x80);
   }
-
   return true;
 }
 
 RtcDateTime readDs3231DateTime() {
   RtcDateTime dateTime;
   dateTime.valid = false;
-
   byte statusRegister = 0;
-
-  if (!readDs3231Registers(0x0F, &statusRegister, 1) || (statusRegister & 0x80)) {
-    return dateTime;
-  }
+  if (!readDs3231Registers(0x0F, &statusRegister, 1) || (statusRegister & 0x80)) return dateTime;
 
   byte buffer[7];
-
-  if (!readDs3231Registers(0x00, buffer, 7)) {
-    return dateTime;
-  }
+  if (!readDs3231Registers(0x00, buffer, 7)) return dateTime;
 
   dateTime.second = bcdToDecimal(buffer[0] & 0x7F);
   dateTime.minute = bcdToDecimal(buffer[1] & 0x7F);
@@ -525,22 +439,16 @@ RtcDateTime readDs3231DateTime() {
   dateTime.month = bcdToDecimal(buffer[5] & 0x1F);
   dateTime.year = 2000 + bcdToDecimal(buffer[6]);
   dateTime.valid = isValidDateTime(dateTime);
-
   return dateTime;
 }
 
 void incrementDate(RtcDateTime &dateTime) {
   dateTime.day++;
   dateTime.dayOfWeek++;
-
-  if (dateTime.dayOfWeek > 7) {
-    dateTime.dayOfWeek = 1;
-  }
-
+  if (dateTime.dayOfWeek > 7) dateTime.dayOfWeek = 1;
   if (dateTime.day > daysInMonth(dateTime.year, dateTime.month)) {
     dateTime.day = 1;
     dateTime.month++;
-
     if (dateTime.month > 12) {
       dateTime.month = 1;
       dateTime.year++;
@@ -549,8 +457,7 @@ void incrementDate(RtcDateTime &dateTime) {
 }
 
 RtcDateTime advanceDateTime(RtcDateTime dateTime, unsigned long elapsedSeconds) {
-  unsigned long secondsOfDay =
-    (dateTime.hour * 3600UL) + (dateTime.minute * 60UL) + dateTime.second;
+  unsigned long secondsOfDay = (dateTime.hour * 3600UL) + (dateTime.minute * 60UL) + dateTime.second;
   unsigned long totalSeconds = secondsOfDay + elapsedSeconds;
 
   while (totalSeconds >= 86400UL) {
@@ -563,7 +470,6 @@ RtcDateTime advanceDateTime(RtcDateTime dateTime, unsigned long elapsedSeconds) 
   dateTime.minute = totalSeconds / 60UL;
   dateTime.second = totalSeconds % 60UL;
   dateTime.valid = true;
-
   return dateTime;
 }
 
@@ -575,41 +481,32 @@ void setSoftwareClock(const RtcDateTime &dateTime) {
 }
 
 bool setCurrentDateTime(const RtcDateTime &dateTime) {
-  if (!isValidDateTime(dateTime)) {
-    return false;
-  }
-
+  if (!isValidDateTime(dateTime)) return false;
   bool rtcUpdated = writeDs3231DateTime(dateTime);
   setSoftwareClock(dateTime);
-
   if (rtcUpdated) {
     DEBUG_PRINTLN("RTC DS3231 updated from Android MQTT payload.");
   } else {
     DEBUG_PRINTLN("RTC DS3231 update failed. Using software clock until RTC is available.");
   }
-
   return rtcUpdated;
 }
 
 RtcDateTime readSoftwareClock() {
   RtcDateTime now = softwareClockBase;
-
   if (!softwareClockValid) {
     now.valid = false;
     return now;
   }
-
   return advanceDateTime(now, (millis() - softwareClockSetMillis) / 1000UL);
 }
 
 RtcDateTime readCurrentDateTime() {
   RtcDateTime rtcNow = readDs3231DateTime();
-
   if (rtcNow.valid) {
     setSoftwareClock(rtcNow);
     return rtcNow;
   }
-
   return readSoftwareClock();
 }
 
@@ -618,13 +515,11 @@ int dateKey(int year, byte month, byte day) {
 }
 
 bool isScheduleDayActive(const RelaySchedule &schedule, byte dayOfWeek) {
-  if (schedule.daysMask == 0) {
-    return true;
-  }
-
+  if (schedule.daysMask == 0) return true;
   return schedule.daysMask & (1 << (dayOfWeek - 1));
 }
 
+// ================= PERBAIKAN: PERHITUNGAN PENJADWALAN SEKUENSIAL =================
 bool isScheduleActiveNow(const RelaySchedule &schedule, const RtcDateTime &now) {
   if (!schedule.enabled || !now.valid || schedule.relay < 1 || schedule.relay > 4) {
     return false;
@@ -639,17 +534,15 @@ bool isScheduleActiveNow(const RelaySchedule &schedule, const RtcDateTime &now) 
   }
 
   unsigned long nowSeconds = (now.hour * 3600UL) + (now.minute * 60UL) + now.second;
-  unsigned long startSeconds = (schedule.hour * 3600UL) + (schedule.minute * 60UL);
+  // Tambahkan startDelaySeconds agar waktu mulai tiap relay berurutan (bukan bersamaan)
+  unsigned long startSeconds = (schedule.hour * 3600UL) + (schedule.minute * 60UL) + schedule.startDelaySeconds;
   unsigned long endSeconds = startSeconds + schedule.durationSeconds;
 
   return nowSeconds >= startSeconds && nowSeconds < endSeconds;
 }
 
 int relayPin(byte relay) {
-  if (relay < 1 || relay > 4) {
-    return -1;
-  }
-
+  if (relay < 1 || relay > 4) return -1;
   return RELAY_PINS[relay - 1];
 }
 
@@ -662,34 +555,35 @@ void setupRelays() {
 
 void setRelayState(byte relay, bool isOn) {
   int pin = relayPin(relay);
-
-  if (pin < 0) {
-    return;
+  if (pin < 0) return;
+  int targetState = isOn ? RELAY_ON : RELAY_OFF;
+  if (digitalRead(pin) != targetState) {
+    digitalWrite(pin, targetState);
   }
-
-  digitalWrite(pin, isOn ? RELAY_ON : RELAY_OFF);
 }
 
 void setManualRelayOverride(byte relay, bool isOn) {
-  if (relay < 1 || relay > 4) {
-    return;
+  if (relay < 1 || relay > 4) return;
+  if (isOn) {
+    // Apabila ada perintah menyalakan 1 relay, paksa 3 relay lainnya MATI secara fisik
+    for (byte i = 0; i < 4; i++) {
+      manualOverrideActive[i] = true;
+      manualOverrideState[i] = (i == (relay - 1));
+      setRelayState(i + 1, manualOverrideState[i]);
+    }
+  } else {
+    manualOverrideActive[relay - 1] = true;
+    manualOverrideState[relay - 1] = false;
+    setRelayState(relay, false);
   }
-
-  manualOverrideActive[relay - 1] = true;
-  manualOverrideState[relay - 1] = isOn;
-  setRelayState(relay, isOn);
-
-  DEBUG_PRINT("Manual override Relay");
+  DEBUG_PRINT("Manual override Relay ");
   DEBUG_PRINT(relay);
   DEBUG_PRINT(": ");
   DEBUG_PRINTLN(isOn ? "ON" : "OFF");
 }
 
 void clearManualOverride(byte relay) {
-  if (relay < 1 || relay > 4 || !manualOverrideActive[relay - 1]) {
-    return;
-  }
-
+  if (relay < 1 || relay > 4 || !manualOverrideActive[relay - 1]) return;
   manualOverrideActive[relay - 1] = false;
 
   DEBUG_PRINT("Manual override Relay");
@@ -697,6 +591,7 @@ void clearManualOverride(byte relay) {
   DEBUG_PRINTLN(" released by schedule transition.");
 }
 
+// ================= PERBAIKAN: HARDWARE INTERLOCK SAFETY =================
 void applyRelaySchedules(const RtcDateTime &now) {
   bool relayAutoActive[4] = { false, false, false, false };
   bool relayConfigured[4] = { false, false, false, false };
@@ -709,6 +604,19 @@ void applyRelaySchedules(const RtcDateTime &now) {
 
       if (isScheduleActiveNow(schedule, now)) {
         relayAutoActive[schedule.relay - 1] = true;
+      }
+    }
+  }
+
+  // Interlock Safety: Jika ada > 1 relay otomatis yang terdeteksi aktif di detik yang sama,
+  // prioritaskan relay pertama dan paksa matikan relay lainnya agar tidak pernah bentrok fisik.
+  bool activeFound = false;
+  for (byte i = 0; i < 4; i++) {
+    if (relayAutoActive[i]) {
+      if (activeFound) {
+        relayAutoActive[i] = false; // Matikan relay bertabrakan
+      } else {
+        activeFound = true;
       }
     }
   }
@@ -731,23 +639,28 @@ void applyRelaySchedules(const RtcDateTime &now) {
   }
 }
 
+unsigned long lastLcdRefreshTime = 0;
+const unsigned long LCD_REFRESH_INTERVAL = 500;
+
 void maintainLcdDisplay() {
   RtcDateTime now = readCurrentDateTime();
-
-  if (!now.valid) {
-    showSensorScreen = true;
-  }
+  if (!now.valid) showSensorScreen = true;
 
   unsigned long duration = showSensorScreen ? LCD_SENSOR_SCREEN_DURATION : LCD_TIME_SCREEN_DURATION;
 
   if (now.valid && millis() - lcdScreenStartedAt >= duration) {
     showSensorScreen = !showSensorScreen;
     lcdScreenStartedAt = millis();
+    lcd.clear();
   }
+
+  // Batasi refresh rate LCD agar tenang dan tidak kedap-kedip
+  if (millis() - lastLcdRefreshTime < LCD_REFRESH_INTERVAL) return;
+  lastLcdRefreshTime = millis();
 
   if (showSensorScreen) {
     if (hasValidSensorData) {
-      displaySensorData(lastNitrogen, lastPhosphorus, lastPotassium, lastPh, lastMoisture, lastTemperature);
+      displaySensorData(lastNitrogen, lastPhosphorus, lastPotassium, lastPh, lastMoisture, lastTemperature, lastEc);
     } else {
       displaySensorError();
     }
@@ -797,10 +710,6 @@ void printRange(const char* label, float minValue, float maxValue) {
 
 void printThresholds() {
   DEBUG_PRINTLN("===== CURRENT THRESHOLDS =====");
-
-  printRange("Nitrogen    ", MIN_NITROGEN, MAX_NITROGEN);
-  printRange("Phosphorus  ", MIN_PHOSPHORUS, MAX_PHOSPHORUS);
-  printRange("Potassium   ", MIN_POTASSIUM, MAX_POTASSIUM);
   printRange("pH          ", MIN_PH, MAX_PH);
   printRange("Moisture    ", MIN_MOISTURE, MAX_MOISTURE);
   printRange("Temperature ", MIN_TEMPERATURE, MAX_TEMPERATURE);
@@ -818,12 +727,8 @@ void printValueRange(const char* label, float value, float minValue, float maxVa
   DEBUG_PRINTLN(")");
 }
 
-void printThresholdCheck(float nitrogen, float phosphorus, float potassium, float ph, float moisture, float temperature, float ec) {
+void printThresholdCheck(float ph, float moisture, float temperature, float ec) {
   DEBUG_PRINTLN("===== DEBUG THRESHOLD CHECK =====");
-
-  printValueRange("Nitrogen    ", nitrogen, MIN_NITROGEN, MAX_NITROGEN);
-  printValueRange("Phosphorus  ", phosphorus, MIN_PHOSPHORUS, MAX_PHOSPHORUS);
-  printValueRange("Potassium   ", potassium, MIN_POTASSIUM, MAX_POTASSIUM);
   printValueRange("pH          ", ph, MIN_PH, MAX_PH);
   printValueRange("Moisture    ", moisture, MIN_MOISTURE, MAX_MOISTURE);
   printValueRange("Temperature ", temperature, MIN_TEMPERATURE, MAX_TEMPERATURE);
@@ -836,8 +741,6 @@ void setup_wifi() {
 
   WiFi.setAutoReconnect(false);
   WiFi.mode(WIFI_STA);
-
-  // Hentikan koneksi STA sebelumnya tanpa menghapus SSID.
   WiFi.disconnect(false, false);
   delay(300);
 
@@ -849,9 +752,6 @@ void setup_wifi() {
   wifiManager.setMinimumSignalQuality(0);
   wifiManager.setRemoveDuplicateAPs(false);
 
-  // Jangan aktifkan pada program final.
-  // wifiManager.resetSettings();
-
   bool connected = wifiManager.autoConnect(WIFI_MANAGER_AP_NAME, WIFI_MANAGER_AP_PASSWORD);
 
   wifiStarted = true;
@@ -860,7 +760,6 @@ void setup_wifi() {
   if (connected || WiFi.status() == WL_CONNECTED) {
     wifiManagerPortalRunning = false;
     wifiConnectedLogged = true;
-
     WiFi.setAutoReconnect(false);
 
     DEBUG_PRINTLN("WiFi connected.");
@@ -869,7 +768,6 @@ void setup_wifi() {
     return;
   }
 
-  // autoConnect non-blocking membuka portal dan kembali ke program.
   wifiManagerPortalRunning = true;
   wifiPortalStartedAt = millis();
   wifiConnectedLogged = false;
@@ -880,21 +778,10 @@ void setup_wifi() {
 }
 
 void startWifiConfigPortal() {
-  if (wifiManagerPortalRunning) {
-    return;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    return;
-  }
+  if (wifiManagerPortalRunning || WiFi.status() == WL_CONNECTED) return;
 
   DEBUG_PRINTLN("Starting NutriXense config portal...");
-
-  // Cegah proses reconnect otomatis bertabrakan dengan scan.
   WiFi.setAutoReconnect(false);
-
-  // Batalkan koneksi STA yang masih berjalan,
-  // tanpa menghapus kredensial dari NVS.
   WiFi.disconnect(false, false);
   delay(500);
 
@@ -902,11 +789,7 @@ void startWifiConfigPortal() {
   WiFi.scanDelete();
   delay(200);
 
-  wifiManager.startConfigPortal(
-    WIFI_MANAGER_AP_NAME,
-    WIFI_MANAGER_AP_PASSWORD
-  );
-
+  wifiManager.startConfigPortal(WIFI_MANAGER_AP_NAME, WIFI_MANAGER_AP_PASSWORD);
   wifiManagerPortalRunning = true;
   wifiPortalStartedAt = millis();
   lastWifiAttemptTime = millis();
@@ -916,38 +799,22 @@ void startWifiConfigPortal() {
 }
 
 void tryReconnectSavedWiFi() {
-  // Sangat penting:
-  // jangan reconnect ketika portal sedang scan.
-  if (wifiManagerPortalRunning) {
-    return;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    return;
-  }
+  if (wifiManagerPortalRunning || WiFi.status() == WL_CONNECTED) return;
 
   DEBUG_PRINTLN("Trying saved WiFi credentials...");
-
   WiFi.setAutoReconnect(false);
   WiFi.mode(WIFI_STA);
-
-  // Membatalkan kemungkinan percobaan sebelumnya.
   WiFi.disconnect(false, false);
   delay(150);
 
-  // begin() tanpa parameter menggunakan konfigurasi tersimpan.
   WiFi.begin();
-
   lastWifiAttemptTime = millis();
 }
 
 void stopWifiConfigPortalSafe() {
-  if (!wifiManagerPortalRunning) {
-    return;
-  }
+  if (!wifiManagerPortalRunning) return;
 
   DEBUG_PRINTLN("Stopping WiFi configuration portal...");
-
   wifiManager.stopConfigPortal();
   WiFi.softAPdisconnect(false);
 
@@ -960,9 +827,7 @@ void stopWifiConfigPortalSafe() {
 
 // ================= MQTT CONNECT =================
 void reconnect() {
-  if (WiFi.status() != WL_CONNECTED || client.connected()) {
-    return;
-  }
+  if (WiFi.status() != WL_CONNECTED || client.connected()) return;
 
   lastMqttAttemptTime = millis();
   DEBUG_PRINT("Connecting MQTT...");
@@ -980,16 +845,11 @@ void reconnect() {
     client.subscribe("nutrixense/schedule");
     DEBUG_PRINTLN("Subscribed: nutrixense/schedule");
   } else {
-    if (mqttFailedAttempts < 255) {
-      mqttFailedAttempts++;
-    }
-
+    if (mqttFailedAttempts < 255) mqttFailedAttempts++;
     DEBUG_PRINT("MQTT Failed, rc=");
     DEBUG_PRINT(client.state());
     DEBUG_PRINT(" attempts=");
     DEBUG_PRINTLN(mqttFailedAttempts);
-
-    DEBUG_PRINTLN("MQTT will retry later.");
   }
 }
 
@@ -999,14 +859,10 @@ void maintainNetwork() {
     return;
   }
 
-  // Portal non-blocking wajib diproses secara rutin.
   if (wifiManagerPortalRunning) {
     wifiManager.process();
   }
 
-  // =====================================================
-  // WIFI CONNECTED
-  // =====================================================
   if (WiFi.status() == WL_CONNECTED) {
     wifiDisconnectedSince = 0;
 
@@ -1016,7 +872,6 @@ void maintainNetwork() {
 
     if (!wifiConnectedLogged) {
       wifiConnectedLogged = true;
-
       DEBUG_PRINTLN("WiFi connected.");
       DEBUG_PRINT("SSID: ");
       DEBUG_PRINTLN(WiFi.SSID());
@@ -1024,66 +879,36 @@ void maintainNetwork() {
       DEBUG_PRINTLN(WiFi.localIP());
     }
 
-    if (
-      !client.connected() &&
-      millis() - lastMqttAttemptTime >= MQTT_RETRY_INTERVAL
-    ) {
+    if (!client.connected() && millis() - lastMqttAttemptTime >= MQTT_RETRY_INTERVAL) {
       reconnect();
     }
 
     if (client.connected()) {
       client.loop();
     }
-
     return;
   }
 
-  // =====================================================
-  // WIFI DISCONNECTED
-  // =====================================================
   wifiConnectedLogged = false;
+  if (client.connected()) client.disconnect();
+  if (wifiDisconnectedSince == 0) wifiDisconnectedSince = millis();
 
-  if (client.connected()) {
-    client.disconnect();
-  }
-
-  if (wifiDisconnectedSince == 0) {
-    wifiDisconnectedSince = millis();
-  }
-
-  // Saat portal aktif, jangan memanggil begin/reconnect/mode.
   if (wifiManagerPortalRunning) {
-    if (
-      millis() - wifiPortalStartedAt >=
-      WIFI_PORTAL_MAX_DURATION
-    ) {
+    if (millis() - wifiPortalStartedAt >= WIFI_PORTAL_MAX_DURATION) {
       DEBUG_PRINTLN("Portal timeout. Closing portal.");
       stopWifiConfigPortalSafe();
-
-      // Mulai ulang periode pencarian WiFi tersimpan.
       wifiDisconnectedSince = millis();
-
-      // Agar percobaan reconnect dapat dilakukan segera.
       lastWifiAttemptTime = millis() - WIFI_RETRY_INTERVAL;
     }
-
     return;
   }
 
-  // Beri kesempatan reconnect selama satu menit dahulu.
-  if (
-    millis() - wifiDisconnectedSince >=
-    WIFI_PORTAL_OPEN_DELAY
-  ) {
+  if (millis() - wifiDisconnectedSince >= WIFI_PORTAL_OPEN_DELAY) {
     startWifiConfigPortal();
     return;
   }
 
-  // Percobaan koneksi tersimpan dilakukan berkala.
-  if (
-    millis() - lastWifiAttemptTime >=
-    WIFI_RETRY_INTERVAL
-  ) {
+  if (millis() - lastWifiAttemptTime >= WIFI_RETRY_INTERVAL) {
     tryReconnectSavedWiFi();
   }
 }
@@ -1097,23 +922,19 @@ byte calculateDayOfWeek(int year, byte month, byte day) {
   int k = year % 100;
   int j = year / 100;
   int h = (day + ((13 * (month + 1)) / 5) + k + (k / 4) + (j / 4) + (5 * j)) % 7;
-
   return ((h + 6) % 7) + 1;
 }
 
 bool readSensorData(float &moisture, float &temperature, float &ec, float &ph, float &nitrogen, float &phosphorus, float &potassium) {
   uint8_t result = node.readHoldingRegisters(0x00, 7);
-
   if (result != node.ku8MBSuccess) {
     DEBUG_PRINTLN("FAILED reading sensor registers!");
     return false;
   }
 
   moisture = node.getResponseBuffer(0) / 10.0;
-
   int16_t tempRaw = (int16_t)node.getResponseBuffer(1);
   temperature = tempRaw / 10.0;
-
   ec = node.getResponseBuffer(2) / 1000.0;
   ph = node.getResponseBuffer(3) / 10.0;
   nitrogen = node.getResponseBuffer(4);
@@ -1144,6 +965,10 @@ String buildSensorPayload(float moisture, float temperature, float ec, float ph,
   doc["rtc_available"] = ds3231Available ? 1 : 0;
   doc["schedule_storage"] = at24c32Available ? 1 : 0;
   doc["source"] = source;
+
+  doc["npk_interpretation"] = "estimated_trend";
+  doc["nutrient_control_basis"] = "ec";
+  doc["fertilizer_control_mode"] = "ec_recipe_dosing";
 
   if (now.valid) {
     JsonObject rtc = doc.createNestedObject("rtc");
@@ -1186,24 +1011,11 @@ String buildRelayStatusPayload(const RtcDateTime &now, const char* source) {
 }
 
 void publishRelayStatusNow(const char* source) {
-  if (!client.connected()) {
-    return;
-  }
+  if (!client.connected()) return;
 
   RtcDateTime now = readCurrentDateTime();
-
   String payload = hasValidSensorData
-      ? buildSensorPayload(
-          lastMoisture,
-          lastTemperature,
-          lastEc,
-          lastPh,
-          lastNitrogen,
-          lastPhosphorus,
-          lastPotassium,
-          now,
-          source
-        )
+      ? buildSensorPayload(lastMoisture, lastTemperature, lastEc, lastPh, lastNitrogen, lastPhosphorus, lastPotassium, now, source)
       : buildRelayStatusPayload(now, source);
 
   if (client.publish(realtimeTopic, payload.c_str())) {
@@ -1214,45 +1026,31 @@ void publishRelayStatusNow(const char* source) {
 }
 
 bool parseDateString(const char* dateText, int &year, byte &month, byte &day) {
-  if (dateText == nullptr || strlen(dateText) < 10) {
-    return false;
-  }
-
+  if (dateText == nullptr || strlen(dateText) < 10) return false;
   String value = String(dateText);
   year = value.substring(0, 4).toInt();
   month = value.substring(5, 7).toInt();
   day = value.substring(8, 10).toInt();
-
   return year >= 2024 && month >= 1 && month <= 12 && day >= 1 && day <= 31;
 }
 
 bool parseTimeString(const char* timeText, byte &hour, byte &minute) {
-  if (timeText == nullptr || strlen(timeText) < 5) {
-    return false;
-  }
-
+  if (timeText == nullptr || strlen(timeText) < 5) return false;
   String value = String(timeText);
   hour = value.substring(0, 2).toInt();
   minute = value.substring(3, 5).toInt();
-
   return hour <= 23 && minute <= 59;
 }
 
 byte parseDaysMask(JsonVariant days) {
-  if (!days.is<JsonArray>()) {
-    return 0;
-  }
-
+  if (!days.is<JsonArray>()) return 0;
   byte mask = 0;
-
   for (JsonVariant day : days.as<JsonArray>()) {
     byte dayOfWeek = day.as<byte>();
-
     if (dayOfWeek >= 1 && dayOfWeek <= 7) {
       mask |= (1 << (dayOfWeek - 1));
     }
   }
-
   return mask;
 }
 
@@ -1269,91 +1067,59 @@ byte calculateScheduleStorageChecksum(byte *buffer) {
   byte checksum = 0;
   byte originalChecksum = buffer[SCHEDULE_STORAGE_CHECKSUM_INDEX];
   buffer[SCHEDULE_STORAGE_CHECKSUM_INDEX] = 0;
-
   for (uint16_t i = 0; i < SCHEDULE_STORAGE_TOTAL_BYTES; i++) {
     checksum += buffer[i];
   }
-
   buffer[SCHEDULE_STORAGE_CHECKSUM_INDEX] = originalChecksum;
   return checksum;
 }
 
 bool readAt24C32Bytes(uint16_t address, byte *buffer, uint16_t length) {
-  if (!at24c32Available) {
-    return false;
-  }
-
+  if (!at24c32Available) return false;
   uint16_t offset = 0;
-
   while (offset < length) {
     byte chunk = length - offset;
-
-    if (chunk > AT24C32_PAGE_SIZE) {
-      chunk = AT24C32_PAGE_SIZE;
-    }
+    if (chunk > AT24C32_PAGE_SIZE) chunk = AT24C32_PAGE_SIZE;
 
     Wire.beginTransmission(AT24C32_ADDRESS);
     Wire.write((address + offset) >> 8);
     Wire.write((address + offset) & 0xFF);
 
-    if (Wire.endTransmission(false) != 0) {
-      return false;
-    }
+    if (Wire.endTransmission(false) != 0) return false;
 
     byte readCount = Wire.requestFrom(AT24C32_ADDRESS, chunk);
+    if (readCount != chunk) return false;
 
-    if (readCount != chunk) {
-      return false;
-    }
-
-    for (byte i = 0; i < chunk; i++) {
-      buffer[offset + i] = Wire.read();
-    }
-
+    for (byte i = 0; i < chunk; i++) buffer[offset + i] = Wire.read();
     offset += chunk;
   }
-
   return true;
 }
 
 bool writeAt24C32Bytes(uint16_t address, const byte *buffer, uint16_t length) {
-  if (!at24c32Available) {
-    return false;
-  }
-
+  if (!at24c32Available) return false;
   uint16_t offset = 0;
 
   while (offset < length) {
     byte pageRemaining = AT24C32_PAGE_SIZE - ((address + offset) % AT24C32_PAGE_SIZE);
     byte chunk = length - offset;
-
-    if (chunk > pageRemaining) {
-      chunk = pageRemaining;
-    }
+    if (chunk > pageRemaining) chunk = pageRemaining;
 
     Wire.beginTransmission(AT24C32_ADDRESS);
     Wire.write((address + offset) >> 8);
     Wire.write((address + offset) & 0xFF);
 
-    for (byte i = 0; i < chunk; i++) {
-      Wire.write(buffer[offset + i]);
-    }
-
-    if (Wire.endTransmission() != 0) {
-      return false;
-    }
+    for (byte i = 0; i < chunk; i++) Wire.write(buffer[offset + i]);
+    if (Wire.endTransmission() != 0) return false;
 
     delay(6);
     offset += chunk;
   }
-
   return true;
 }
 
 bool isValidSchedule(const RelaySchedule &schedule) {
-  if (!schedule.enabled) {
-    return true;
-  }
+  if (!schedule.enabled) return true;
 
   return schedule.relay >= 1 && schedule.relay <= 4 &&
          schedule.startYear >= 2024 && schedule.startYear <= 2099 &&
@@ -1364,8 +1130,7 @@ bool isValidSchedule(const RelaySchedule &schedule) {
          schedule.endDay >= 1 && schedule.endDay <= daysInMonth(schedule.endYear, schedule.endMonth) &&
          dateKey(schedule.startYear, schedule.startMonth, schedule.startDay) <=
            dateKey(schedule.endYear, schedule.endMonth, schedule.endDay) &&
-         schedule.hour <= 23 &&
-         schedule.minute <= 59 &&
+         schedule.hour <= 23 && schedule.minute <= 59 &&
          schedule.durationSeconds > 0 && schedule.durationSeconds <= 65535 &&
          schedule.daysMask <= 0x7F;
 }
@@ -1383,16 +1148,15 @@ void clearSchedules() {
     relaySchedules[i].hour = 6;
     relaySchedules[i].minute = 0;
     relaySchedules[i].durationSeconds = 5;
+    relaySchedules[i].startDelaySeconds = 0;
     relaySchedules[i].daysMask = 0;
   }
 }
 
+// ================= PERBAIKAN: EEPROM SAVE & LOAD FOR START_DELAY_SECONDS =================
 bool saveSchedulesToEeprom() {
   byte buffer[SCHEDULE_STORAGE_TOTAL_BYTES];
-
-  for (uint16_t i = 0; i < SCHEDULE_STORAGE_TOTAL_BYTES; i++) {
-    buffer[i] = 0;
-  }
+  for (uint16_t i = 0; i < SCHEDULE_STORAGE_TOTAL_BYTES; i++) buffer[i] = 0;
 
   buffer[0] = SCHEDULE_STORAGE_MAGIC_0;
   buffer[1] = SCHEDULE_STORAGE_MAGIC_1;
@@ -1417,7 +1181,8 @@ bool saveSchedulesToEeprom() {
     buffer[index + 10] = schedule.hour;
     buffer[index + 11] = schedule.minute;
     writeUint16(buffer, index + 12, schedule.durationSeconds);
-    buffer[index + 14] = schedule.daysMask;
+    writeUint16(buffer, index + 14, schedule.startDelaySeconds);
+    buffer[index + 16] = schedule.daysMask;
   }
 
   buffer[SCHEDULE_STORAGE_CHECKSUM_INDEX] = calculateScheduleStorageChecksum(buffer);
@@ -1468,7 +1233,8 @@ bool loadSchedulesFromEeprom() {
     schedule.hour = buffer[index + 10];
     schedule.minute = buffer[index + 11];
     schedule.durationSeconds = readUint16(buffer, index + 12);
-    schedule.daysMask = buffer[index + 14];
+    schedule.startDelaySeconds = readUint16(buffer, index + 14);
+    schedule.daysMask = buffer[index + 16];
 
     if (!isValidSchedule(schedule)) {
       DEBUG_PRINTLN("Saved schedule is invalid. Ignoring AT24C32 data.");
@@ -1488,7 +1254,6 @@ bool savePayloadToLittleFS(const String &payload) {
     return false;
   }
   File file = LittleFS.open(OFFLINE_LOG_FILE, FILE_APPEND);
-
   if (!file) {
     DEBUG_PRINTLN("Failed to open offline log file for append.");
     return false;
@@ -1514,9 +1279,7 @@ bool savePayloadToLittleFS(const String &payload) {
 }
 
 String formatTimestamp(const RtcDateTime &now) {
-  if (!now.valid) {
-    return "";
-  }
+  if (!now.valid) return "";
 
   String timestamp = "";
   timestamp += String(now.year);
@@ -1539,7 +1302,6 @@ bool shouldLogHistory() {
     lastHistoryLogTime = millis();
     return true;
   }
-
   return false;
 }
 
@@ -1572,9 +1334,7 @@ void setupRtcAndScheduleStorage() {
 }
 
 void updateRtcFromJson(JsonObject rtcConfig) {
-  if (rtcConfig.isNull()) {
-    return;
-  }
+  if (rtcConfig.isNull()) return;
 
   bool forceUpdate = (rtcConfig["force_update"] | false) || (rtcConfig["force"] | false);
   RtcDateTime currentRtc = readDs3231DateTime();
@@ -1607,23 +1367,21 @@ void updateRtcFromJson(JsonObject rtcConfig) {
   }
 }
 
+// ================= PERBAIKAN: BACA START_DELAY_SECONDS DARI JSON =================
 void updateSchedulesFromJson(JsonArray schedules) {
-  if (schedules.isNull()) {
-    return;
-  }
+  if (schedules.isNull()) return;
 
   clearSchedules();
   byte index = 0;
 
   for (JsonObject item : schedules) {
-    if (index >= MAX_SCHEDULES) {
-      break;
-    }
+    if (index >= MAX_SCHEDULES) break;
 
     RelaySchedule &schedule = relaySchedules[index];
     schedule.enabled = item["enabled"] | true;
     schedule.relay = item["relay"] | 1;
     schedule.durationSeconds = item["duration_seconds"] | 5;
+    schedule.startDelaySeconds = item["start_delay_seconds"] | 0; // Baca jeda sekuensial
     schedule.daysMask = parseDaysMask(item["days"]);
 
     const char* startDateText = item["start_date"] | "2024-01-01";
@@ -1651,134 +1409,60 @@ void setupLittleFS() {
     littleFsReady = false;
     return;
   }
-
   littleFsReady = true;
-
   DEBUG_PRINTLN("LittleFS mounted successfully.");
-
-  size_t totalBytes = LittleFS.totalBytes();
-  size_t usedBytes = LittleFS.usedBytes();
-
-  DEBUG_PRINT("LittleFS Total: ");
-  DEBUG_PRINT(totalBytes);
-  DEBUG_PRINTLN(" bytes");
-
-  DEBUG_PRINT("LittleFS Used : ");
-  DEBUG_PRINT(usedBytes);
-  DEBUG_PRINTLN(" bytes");
 }
 
 void inspectLittleFS() {
   Serial.println();
   Serial.println("===== LITTLEFS INSPECTION =====");
-
-  if (!littleFsReady) {
-    Serial.println("ERROR: LittleFS belum siap.");
-    return;
-  }
+  if (!littleFsReady) return;
 
   Serial.printf("Total LittleFS : %u bytes\n", LittleFS.totalBytes());
   Serial.printf("Used LittleFS  : %u bytes\n", LittleFS.usedBytes());
 
   File root = LittleFS.open("/");
-
-  if (!root || !root.isDirectory()) {
-    Serial.println("Gagal membuka direktori root LittleFS.");
-    return;
-  }
+  if (!root || !root.isDirectory()) return;
 
   File file = root.openNextFile();
-
   while (file) {
-    Serial.printf(
-      "File: %s | Size: %u bytes\n",
-      file.name(),
-      static_cast<unsigned int>(file.size())
-    );
-
+    Serial.printf("File: %s | Size: %u bytes\n", file.name(), static_cast<unsigned int>(file.size()));
     file.close();
     file = root.openNextFile();
   }
-
   root.close();
   Serial.println("===============================");
 }
 
 void recoverOfflineTempFile() {
-  if (!littleFsReady) {
-    return;
-  }
-
+  if (!littleFsReady) return;
   bool logExists = LittleFS.exists(OFFLINE_LOG_FILE);
   bool tempExists = LittleFS.exists(OFFLINE_TEMP_FILE);
 
   if (!logExists && tempExists) {
-    Serial.println(
-      "Recovering offline log from temporary file..."
-    );
-
-    if (LittleFS.rename(
-          OFFLINE_TEMP_FILE,
-          OFFLINE_LOG_FILE
-        )) {
+    if (LittleFS.rename(OFFLINE_TEMP_FILE, OFFLINE_LOG_FILE)) {
       Serial.println("Temporary offline log recovered.");
-    } else {
-      Serial.println(
-        "ERROR: Failed recovering temporary offline log."
-      );
     }
-
     return;
   }
 
   if (logExists && tempExists) {
     offlineFileConflict = true;
-    Serial.println(
-      "WARNING: Both offline and temp files exist."
-    );
-    Serial.println(
-      "Both files are preserved to prevent data loss."
-    );
   }
 }
 
 void syncOfflineDataToMqtt() {
-  if (!littleFsReady) {
-    return;
-  }
-
-  if (offlineFileConflict) {
-    DEBUG_PRINTLN(
-      "Offline sync blocked because both log files exist."
-    );
-    return;
-  }
-
-  if (!client.connected()) {
-    return;
-  }
-
-  if (millis() - lastOfflineSyncTime < OFFLINE_SYNC_INTERVAL) {
-    return;
-  }
+  if (!littleFsReady || offlineFileConflict || !client.connected()) return;
+  if (millis() - lastOfflineSyncTime < OFFLINE_SYNC_INTERVAL) return;
 
   lastOfflineSyncTime = millis();
-
-  if (!LittleFS.exists(OFFLINE_LOG_FILE)) {
-    return;
-  }
+  if (!LittleFS.exists(OFFLINE_LOG_FILE)) return;
 
   File sourceFile = LittleFS.open(OFFLINE_LOG_FILE, FILE_READ);
-
-  if (!sourceFile) {
-    DEBUG_PRINTLN("Failed to open offline log file for reading.");
-    return;
-  }
+  if (!sourceFile) return;
 
   File tempFile = LittleFS.open(OFFLINE_TEMP_FILE, FILE_WRITE);
-
   if (!tempFile) {
-    DEBUG_PRINTLN("Failed to open temp offline log file.");
     sourceFile.close();
     return;
   }
@@ -1789,28 +1473,16 @@ void syncOfflineDataToMqtt() {
   while (sourceFile.available()) {
     String line = sourceFile.readStringUntil('\n');
     line.trim();
-
-    if (line.length() == 0) {
-      continue;
-    }
+    if (line.length() == 0) continue;
 
     if (syncedThisLoop < MAX_SYNC_PER_LOOP && !syncLimitReached) {
-      DEBUG_PRINTLN("Syncing offline payload:");
-      DEBUG_PRINTLN(line);
-
-      bool published = client.publish(historyTopic , line.c_str());
-
+      bool published = client.publish(historyTopic, line.c_str());
       if (published) {
         syncedThisLoop++;
         offlineSyncedCount++;
-
-        DEBUG_PRINT("Offline payload synced. Total synced: ");
-        DEBUG_PRINTLN(offlineSyncedCount);
-
         client.loop();
         delay(50);
       } else {
-        DEBUG_PRINTLN("Failed to publish offline payload. Keeping data.");
         tempFile.println(line);
         syncLimitReached = true;
       }
@@ -1823,114 +1495,50 @@ void syncOfflineDataToMqtt() {
   tempFile.close();
 
   File checkTemp = LittleFS.open(OFFLINE_TEMP_FILE, FILE_READ);
-
-  bool hasPendingData =
-    checkTemp && checkTemp.size() > 0;
-
-  if (checkTemp) {
-    checkTemp.close();
-  }
+  bool hasPendingData = checkTemp && checkTemp.size() > 0;
+  if (checkTemp) checkTemp.close();
 
   if (!LittleFS.remove(OFFLINE_LOG_FILE)) {
-    DEBUG_PRINTLN(
-      "ERROR: Failed removing original offline log."
-    );
-    DEBUG_PRINTLN(
-      "Original and temporary files are preserved."
-    );
-
     offlineFileConflict = true;
     return;
   }
 
   if (hasPendingData) {
-    if (!LittleFS.rename(
-          OFFLINE_TEMP_FILE,
-          OFFLINE_LOG_FILE
-        )) {
-      DEBUG_PRINTLN(
-        "ERROR: Failed renaming temporary log."
-      );
-
-      DEBUG_PRINTLN(
-        "Pending data remains in temporary file."
-      );
-
+    if (!LittleFS.rename(OFFLINE_TEMP_FILE, OFFLINE_LOG_FILE)) {
       offlineFileConflict = true;
       return;
     }
-
-    DEBUG_PRINTLN("Some offline data still pending.");
   } else {
-    if (LittleFS.exists(OFFLINE_TEMP_FILE)) {
-      LittleFS.remove(OFFLINE_TEMP_FILE);
-    }
-
-    DEBUG_PRINTLN("All offline data published.");
+    if (LittleFS.exists(OFFLINE_TEMP_FILE)) LittleFS.remove(OFFLINE_TEMP_FILE);
   }
 }
 
 void updateFloatIfPresent(JsonDocument &doc, const char* key, float &target) {
-  if (doc.containsKey(key)) {
-    target = doc[key].as<float>();
-  }
+  if (doc.containsKey(key)) target = doc[key].as<float>();
 }
 
 void updateBoolIfPresent(JsonObject obj, const char* key, bool &target) {
-  if (obj.containsKey(key)) {
-    target = obj[key].as<bool>();
-  }
+  if (obj.containsKey(key)) target = obj[key].as<bool>();
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
   String topicStr = String(topic);
-
-  DEBUG_PRINT("Message arrived [");
-  DEBUG_PRINT(topicStr);
-  DEBUG_PRINTLN("]");
-
   String message;
-
-  for (int i = 0; i < length; i++) {
-    message += (char)payload[i];
-  }
-
-  DEBUG_PRINTLN(message);
+  for (int i = 0; i < length; i++) message += (char)payload[i];
 
   DynamicJsonDocument doc(2048);
-
   DeserializationError error = deserializeJson(doc, message);
+  if (error) return;
 
-  if (error) {
-    DEBUG_PRINT("JSON Parse Failed: ");
-    DEBUG_PRINTLN(error.c_str());
-    return;
-  }
-
-  DEBUG_PRINTLN("=== JSON RECEIVED ===");
-
-  #if DEBUG_MODE
-    serializeJsonPretty(doc, Serial);
-    DEBUG_PRINTLN_EMPTY();
-  #endif
-
-  // =====================================================
-  // MQTT TOPIC : nutrixense/control
-  // =====================================================
   if (topicStr == "nutrixense/control") {
-    DEBUG_PRINTLN("=== RELAY CONTROL ===");
     bool relayCommandReceived = false;
     const char* commandSource = doc["source"] | "";
-    bool isManualCommand =
-      strcmp(commandSource, "manual") == 0 || doc.containsKey("manual_override");
+    bool isManualCommand = strcmp(commandSource, "manual") == 0 || doc.containsKey("manual_override");
 
     for (byte relay = 1; relay <= 4; relay++) {
       char relayKey[8];
       snprintf(relayKey, sizeof(relayKey), "relay%d", relay);
-
-      if (!doc.containsKey(relayKey)) {
-        continue;
-      }
+      if (!doc.containsKey(relayKey)) continue;
 
       relayCommandReceived = true;
       int state = doc[relayKey].as<int>();
@@ -1941,11 +1549,6 @@ void callback(char* topic, byte* payload, unsigned int length) {
       } else {
         manualOverrideActive[relay - 1] = false;
         setRelayState(relay, isOn);
-
-        DEBUG_PRINT("Relay");
-        DEBUG_PRINT(relay);
-        DEBUG_PRINT(": ");
-        DEBUG_PRINTLN(isOn ? "ON" : "OFF");
       }
     }
 
@@ -1953,79 +1556,35 @@ void callback(char* topic, byte* payload, unsigned int length) {
       publishRelayStatusNow("relay_status");
     }
   }
-
-  // =====================================================
-  // MQTT TOPIC : nutrixense/schedule
-  // RTC is written only when DS3231 time is invalid, or rtc.force_update=true.
-  // Schedules are saved to AT24C32.
-  // =====================================================
   else if (topicStr == "nutrixense/schedule") {
-    DEBUG_PRINTLN("=== SCHEDULE CONFIG ===");
-
     updateRtcFromJson(doc["rtc"].as<JsonObject>());
-
     if (doc.containsKey("schedules")) {
       updateSchedulesFromJson(doc["schedules"].as<JsonArray>());
     }
   }
-
-  // =====================================================
-  // MQTT TOPIC : nutrixense/config
-  // =====================================================
   else if (topicStr == "nutrixense/config") {
-    DEBUG_PRINTLN("=== THRESHOLD CONFIG ===");
-
-    updateFloatIfPresent(doc, "min_nitrogen", MIN_NITROGEN);
-    updateFloatIfPresent(doc, "min_phosphorus", MIN_PHOSPHORUS);
-    updateFloatIfPresent(doc, "min_potassium", MIN_POTASSIUM);
     updateFloatIfPresent(doc, "min_ph", MIN_PH);
     updateFloatIfPresent(doc, "min_moisture", MIN_MOISTURE);
     updateFloatIfPresent(doc, "min_temperature", MIN_TEMPERATURE);
     updateFloatIfPresent(doc, "min_ec", MIN_EC);
 
-    updateFloatIfPresent(doc, "max_nitrogen", MAX_NITROGEN);
-    updateFloatIfPresent(doc, "max_phosphorus", MAX_PHOSPHORUS);
-    updateFloatIfPresent(doc, "max_potassium", MAX_POTASSIUM);
     updateFloatIfPresent(doc, "max_ph", MAX_PH);
     updateFloatIfPresent(doc, "max_moisture", MAX_MOISTURE);
     updateFloatIfPresent(doc, "max_temperature", MAX_TEMPERATURE);
     updateFloatIfPresent(doc, "max_ec", MAX_EC);
 
-    DEBUG_PRINTLN("=== THRESHOLD UPDATED ===");
-    printThresholds();
-
     if (doc.containsKey("buzzer_muted")) {
       JsonObject muted = doc["buzzer_muted"];
-
-      updateBoolIfPresent(muted, "nitrogen", MUTE_NITROGEN);
-      updateBoolIfPresent(muted, "phosphorus", MUTE_PHOSPHORUS);
-      updateBoolIfPresent(muted, "potassium", MUTE_POTASSIUM);
       updateBoolIfPresent(muted, "ph", MUTE_PH);
       updateBoolIfPresent(muted, "moisture", MUTE_MOISTURE);
       updateBoolIfPresent(muted, "temperature", MUTE_TEMPERATURE);
       updateBoolIfPresent(muted, "ec", MUTE_EC);
-    }
 
-    if (
-      MIN_NITROGEN <= 0 &&
-      MIN_PHOSPHORUS <= 0 &&
-      MIN_POTASSIUM <= 0 &&
-      MIN_PH <= 0 &&
-      MIN_MOISTURE <= 0 &&
-      MIN_TEMPERATURE <= 0 &&
-      MIN_EC <= 0
-    ) {
-      digitalWrite(BUZZER_PIN, BUZZER_OFF);
-      DEBUG_PRINTLN("All minimum thresholds are 0. Buzzer forced OFF.");
+      // N, P, K Mute mengikuti status Mute EC
+      MUTE_NITROGEN = MUTE_EC;
+      MUTE_PHOSPHORUS = MUTE_EC;
+      MUTE_POTASSIUM = MUTE_EC;
     }
-  }
-
-  // =====================================================
-  // UNKNOWN TOPIC
-  // =====================================================
-  else {
-    DEBUG_PRINT("Unknown MQTT Topic: ");
-    DEBUG_PRINTLN(topicStr);
   }
 }
 
@@ -2057,7 +1616,6 @@ void setup() {
   node.postTransmission(postTransmission);
 
   setup_wifi();
-
   espClient.setInsecure();
 
   client.setServer(mqtt_server, mqtt_port);
@@ -2081,64 +1639,12 @@ void loop() {
   maintainBuzzer(currentNutrientAbnormal);
 
   if (millis() - lastReadTime >= READ_INTERVAL) {
-    DEBUG_PRINTLN("\n===== READING SENSOR =====");
-
-    float moisture = 0;
-    float temperature = 0;
-    float ec = 0;
-    float ph = 0;
-    float nitrogen = 0;
-    float phosphorus = 0;
-    float potassium = 0;
-
-    bool sensorReadSuccess = readSensorData(
-      moisture,
-      temperature,
-      ec,
-      ph,
-      nitrogen,
-      phosphorus,
-      potassium
-    );
-
-    DEBUG_PRINTLN("===== HASIL SENSOR =====");
-
-    DEBUG_PRINT("Soil Moisture : ");
-    DEBUG_PRINT(moisture);
-    DEBUG_PRINTLN(" %");
-
-    DEBUG_PRINT("Temperature   : ");
-    DEBUG_PRINT(temperature);
-    DEBUG_PRINTLN(" C");
-
-    DEBUG_PRINT("EC            : ");
-    DEBUG_PRINT(ec);
-    DEBUG_PRINTLN(" mS/cm");
-
-    DEBUG_PRINT("pH            : ");
-    DEBUG_PRINTLN(ph);
-
-    DEBUG_PRINT("Nitrogen      : ");
-    DEBUG_PRINT(nitrogen);
-    DEBUG_PRINTLN(" mg/kg");
-
-    DEBUG_PRINT("Phosphorus    : ");
-    DEBUG_PRINT(phosphorus);
-    DEBUG_PRINTLN(" mg/kg");
-
-    DEBUG_PRINT("Potassium     : ");
-    DEBUG_PRINT(potassium);
-    DEBUG_PRINTLN(" mg/kg");
-
-    DEBUG_PRINTLN("==========================");
+    float moisture = 0, temperature = 0, ec = 0, ph = 0, nitrogen = 0, phosphorus = 0, potassium = 0;
+    bool sensorReadSuccess = readSensorData(moisture, temperature, ec, ph, nitrogen, phosphorus, potassium);
 
     if (!sensorReadSuccess) {
-      DEBUG_PRINTLN("Sensor read failed!");
-      DEBUG_PRINTLN("Skipping threshold check...");
-
       currentNutrientAbnormal = false;
       hasValidSensorData = false;
-
       lastReadTime = millis();
       return;
     }
@@ -2152,87 +1658,33 @@ void loop() {
     lastPotassium = potassium;
     hasValidSensorData = true;
 
-    printThresholdCheck(
-      nitrogen,
-      phosphorus,
-      potassium,
-      ph,
-      moisture,
-      temperature,
-      ec
-    );
-
     bool nutrientAbnormal =
-     isActiveAbnormal(nitrogen, MIN_NITROGEN, MAX_NITROGEN, MUTE_NITROGEN) ||
-     isActiveAbnormal(phosphorus, MIN_PHOSPHORUS, MAX_PHOSPHORUS, MUTE_PHOSPHORUS) ||
-     isActiveAbnormal(potassium, MIN_POTASSIUM, MAX_POTASSIUM, MUTE_POTASSIUM) ||
      isActiveAbnormal(ph, MIN_PH, MAX_PH, MUTE_PH) ||
      isActiveAbnormal(moisture, MIN_MOISTURE, MAX_MOISTURE, MUTE_MOISTURE) ||
      isActiveAbnormal(temperature, MIN_TEMPERATURE, MAX_TEMPERATURE, MUTE_TEMPERATURE) ||
      isActiveAbnormal(ec, MIN_EC, MAX_EC, MUTE_EC);
 
-    DEBUG_PRINT("nutrientAbnormal = ");
-    DEBUG_PRINTLN(nutrientAbnormal ? "TRUE" : "FALSE");
     currentNutrientAbnormal = nutrientAbnormal;
 
-    if (nutrientAbnormal) {
-      DEBUG_PRINTLN("WARNING: Nutrisi di bawah ambang normal!");
-      DEBUG_PRINTLN("Buzzer beep pattern armed");
-    } else {
-      DEBUG_PRINTLN("Nutrisi Normal");
-      DEBUG_PRINTLN("Buzzer OFF");
-    }
+    String payload = buildSensorPayload(moisture, temperature, ec, ph, nitrogen, phosphorus, potassium, now, "realtime");
 
-    String payload = buildSensorPayload(
-      moisture, temperature, ec, ph,
-      nitrogen, phosphorus, potassium,
-      now,
-      "realtime"
-    );
-
-    // ================= REALTIME MQTT SETIAP 2 DETIK =================
     if (client.connected()) {
-      DEBUG_PRINTLN("Sending realtime MQTT:");
-      DEBUG_PRINTLN(payload);
-
-      if (client.publish(realtimeTopic, payload.c_str())) {
-        DEBUG_PRINTLN("Realtime MQTT Publish Success");
-      } else {
-        DEBUG_PRINTLN("Realtime MQTT Publish Failed");
-      }
-    } else {
-      DEBUG_PRINTLN("MQTT offline. Realtime data only shown on LCD.");
+      client.publish(realtimeTopic, payload.c_str());
     }
 
-    // ================= HISTORICAL LOG SETIAP 1 MENIT =================
     if (shouldLogHistory()) {
       String historyPayload = payload;
-
       if (client.connected()) {
         historyPayload.replace("\"source\":\"realtime\"", "\"source\":\"history\"");
-
-        DEBUG_PRINTLN("Sending history MQTT:");
-        DEBUG_PRINTLN(historyPayload);
-
-        if (client.publish(historyTopic, historyPayload.c_str())) {
-          DEBUG_PRINTLN("History MQTT Publish Success");
-        } else {
-          DEBUG_PRINTLN("History MQTT Publish Failed. Saving to LittleFS.");
-
+        if (!client.publish(historyTopic, historyPayload.c_str())) {
           historyPayload.replace("\"source\":\"history\"", "\"source\":\"offline_cache\"");
           savePayloadToLittleFS(historyPayload);
         }
-
       } else {
         historyPayload.replace("\"source\":\"realtime\"", "\"source\":\"offline_cache\"");
-
-        DEBUG_PRINTLN("MQTT offline. Saving history data to LittleFS:");
-        DEBUG_PRINTLN(historyPayload);
-
         savePayloadToLittleFS(historyPayload);
       }
     }
-
     lastReadTime = millis();
   }
 }
